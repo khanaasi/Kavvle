@@ -1,0 +1,13 @@
+pyrogram
+tgcrypto
+requests
+psutil
+pysubs2
+fontTools
+fastapi
+uvicorn
+kaggle
+librosa
+numpy<2.0.0
+stable-ts
+faster-whisper
