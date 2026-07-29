@@ -72,7 +72,6 @@ try:
             if importlib.util.find_spec(mod) is None:
                 need.append(pip_name)
         if need:
-            # Install dynamically without checking standard caches to guarantee instant startup
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", *need], check=False)
 
     ensure_deps()
