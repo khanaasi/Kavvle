@@ -30,7 +30,7 @@ def report_critical_failure(error_msg):
                 url_send = f"https://api.telegram.org/bot{token}/sendMessage"
                 requests.post(url_send, json=payload, timeout=10)
     except Exception as e:
-        print(f"Failed to transmit failure report: {e}")
+        print(f"Failed to transmit failure report: {e}", file=sys.stderr)
 
 # Wrap whole initialization to catch any bootup/module/config crash
 try:
@@ -85,6 +85,9 @@ try:
 
 except Exception:
     tb = traceback.format_exc()
+    print("=== CRITICAL BOOTSTRAPPING FAILURE ===", file=sys.stderr)
+    print(tb, file=sys.stderr)
+    print("======================================", file=sys.stderr)
     report_critical_failure(tb)
     sys.exit(1)
 
@@ -491,11 +494,14 @@ async def main_driver():
         pass
     await app_up.stop()
 
-# Execution wrapper that ensures any failure reaches the user on Telegram
+# Execution wrapper that ensures any failure reaches standard error logs and Telegram
 if __name__ == "__main__":
     try:
         asyncio.run(main_driver())
     except Exception as outer_err:
         tb_data = traceback.format_exc()
+        print("=== CRITICAL EXECUTION FAILURE ===", file=sys.stderr)
+        print(tb_data, file=sys.stderr)
+        print("==================================", file=sys.stderr)
         report_critical_failure(tb_data)
         sys.exit(1)
