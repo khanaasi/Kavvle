@@ -8,6 +8,9 @@ import datetime
 import http.server
 import threading
 import psutil
+import shutil
+import sys
+from pathlib import Path
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ChatType
@@ -24,7 +27,6 @@ DESK_CHANNEL_ID = int(os.environ.get("DESK_CHANNEL_ID", "-1003700822969"))
 
 KERNEL_PREFIX = "hsbot-"
 
-# Multi-Account Loader for Kaggle
 def load_kaggle_accounts():
     accs = []
     i = 1
@@ -43,18 +45,40 @@ KAG_ACCOUNTS = load_kaggle_accounts()
 
 app = Client("HarsubBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=16)
 
-# States and configurations
 users_data = {}
-wm_positions = {}  # chat_id -> "left" | "right"
+wm_positions = {}
 
 task_queue = asyncio.Queue()
 account_busy = {a["idx"]: False for a in KAG_ACCOUNTS}
-running_tasks = {}  # task_id -> {"account_idx": idx, "kernel": slug, "cancel": bool}
+running_tasks = {}
 task_counter = 0
+
+# ── KAGGLE CREDENTIALS & COMMAND RUNNER ──────────────────────────────
+def write_kaggle_creds(account):
+    """Programmatic safe creation of kaggle.json with strict permissions"""
+    kaggle_dir = Path.home() / ".kaggle"
+    kaggle_dir.mkdir(parents=True, exist_ok=True)
+    creds_file = kaggle_dir / "kaggle.json"
+    with open(creds_file, "w", encoding="utf-8") as f:
+        json.dump({"username": account["user"], "key": account["key"]}, f)
+    try:
+        creds_file.chmod(0o600)
+    except:
+        pass
+
+def run_kaggle_command(account, cmd_args, timeout=60):
+    write_kaggle_creds(account)
+    env = os.environ.copy()
+    env["KAGGLE_USERNAME"] = account["user"]
+    env["KAGGLE_KEY"] = account["key"]
+    return subprocess.run(cmd_args, env=env, capture_output=True, text=True, timeout=timeout)
+
+def ensure_kaggle_installed():
+    if shutil.which("kaggle") is None:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "kaggle"], check=False)
 
 # ── HELPERS & PRIVACY ────────────────────────────────────────────────
 def current_hw_mode():
-    # IST calculation: Raat ke 12 se dopehar ke 12 tak CPU, dopehar se raat tak GPU
     ist = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
     return "cpu" if 0 <= ist.hour < 12 else "gpu"
 
@@ -98,19 +122,10 @@ async def get_pinned_file_link(chat_id, target_name):
         pass
     return "none"
 
-# ── KAGGLE CONTROL HELPERS ──────────────────────────────────────────
-def _kaggle_env(account):
-    env = os.environ.copy()
-    env["KAGGLE_USERNAME"] = account["user"]
-    env["KAGGLE_KEY"] = account["key"]
-    return env
-
+# ── KAGGLE API WRAPPERS ──────────────────────────────────────────────
 def kaggle_list_kernels(account):
     try:
-        out = subprocess.run(
-            ["kaggle", "kernels", "list", "-m", "--csv"],
-            env=_kaggle_env(account), capture_output=True, text=True, timeout=60
-        )
+        out = run_kaggle_command(account, ["kaggle", "kernels", "list", "-m", "--csv"], timeout=45)
         lines = out.stdout.strip().splitlines()
         refs = []
         for line in lines[1:]:
@@ -123,8 +138,7 @@ def kaggle_list_kernels(account):
 
 def kaggle_delete_kernel(account, ref):
     try:
-        subprocess.run(["kaggle", "kernels", "delete", "-y", ref],
-                        env=_kaggle_env(account), capture_output=True, text=True, timeout=60)
+        run_kaggle_command(account, ["kaggle", "kernels", "delete", "-y", ref], timeout=45)
         return True
     except Exception:
         return False
@@ -143,9 +157,19 @@ def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str):
 
     asi_path = os.path.join(os.path.dirname(__file__), "asi.py")
     if not os.path.exists(asi_path):
-        return False, "Worker file asi.py not found on controller!"
+        return False, "Error: asi.py template missing on controller!"
 
     asi_code = open(asi_path, "r", encoding="utf-8").read()
+    
+    # Accurate Replacement pattern to prevent runtime crash
+    cfg = json.dumps(payload)
+    cfg_b64 = base64.b64encode(cfg.encode()).decode()
+    target_match = 'CONFIG_B64 = ""'
+    if target_match in asi_code:
+        asi_code = asi_code.replace(target_match, f'CONFIG_B64 = "{cfg_b64}"')
+    else:
+        return False, "Error: CONFIG_B64 target pattern missing in asi.py"
+
     with open(os.path.join(workdir, f"{slug}.py"), "w", encoding="utf-8") as f:
         f.write(asi_code)
 
@@ -167,22 +191,8 @@ def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str):
     with open(os.path.join(workdir, "kernel-metadata.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f)
 
-    cfg = json.dumps(payload)
-    cfg_b64 = base64.b64encode(cfg.encode()).decode()
-    with open(os.path.join(workdir, f"{slug}.py"), "a", encoding="utf-8") as f:
-        f.write(f"\n\n# __INJECTED_CONFIG__\nCONFIG_B64 = {cfg_b64!r}\n")
-
-    r = subprocess.run(["kaggle", "kernels", "push", "-p", workdir],
-                        env=_kaggle_env(account), capture_output=True, text=True, timeout=90)
-    return r.returncode == 0, r.stdout + r.stderr
-
-def kaggle_kernel_status(account, ref):
-    try:
-        r = subprocess.run(["kaggle", "kernels", "status", ref],
-                            env=_kaggle_env(account), capture_output=True, text=True, timeout=30)
-        return r.stdout.strip()
-    except Exception as e:
-        return str(e)
+    out = run_kaggle_command(account, ["kaggle", "kernels", "push", "-p", workdir], timeout=90)
+    return out.returncode == 0, out.stdout + out.stderr
 
 # ── QUEUE WORKER THREADS ─────────────────────────────────────────────
 async def account_worker(account):
@@ -200,12 +210,11 @@ async def account_worker(account):
             slug = f"{KERNEL_PREFIX}{task_id}"
             running_tasks[task_id] = {"account_idx": idx, "kernel": f"{account_user}/{slug}", "cancel": False}
 
-            # Update the user about Account & Mode being used
             status_text = (
-                f"🚀 **Task is being processed!**\n\n"
-                f"👤 **Account:** Worker Account #{idx} (`{account_user}`)\n"
+                f"🚀 **Task processing on Kaggle!**\n\n"
+                f"👤 **Account:** Account #{idx} (`{account_user}`)\n"
                 f"⚡ **Hardware Mode:** `{hw_mode.upper()}`\n"
-                f"⚙️ *Worker has been initialized and is downloading media...*"
+                f"⚙️ *Worker container initialising and fetching tools...*"
             )
             try:
                 await app.edit_message_text(
@@ -220,8 +229,7 @@ async def account_worker(account):
                 await report_error(task, f"Kaggle push fail (account {idx}):\n{log[-800:]}")
                 continue
 
-            # Poll status until complete/error/cancel
-            for _ in range(2160):  # ~12hr max
+            for _ in range(2160):
                 if running_tasks.get(task_id, {}).get("cancel"):
                     await asyncio.to_thread(kaggle_delete_kernel, account, f"{account_user}/{slug}")
                     break
@@ -232,7 +240,7 @@ async def account_worker(account):
 
             await asyncio.to_thread(kaggle_delete_kernel, account, f"{account_user}/{slug}")
         except Exception as e:
-            await report_error(task, f"Worker error: {e}")
+            await report_error(task, f"Worker exception occurred: {e}")
         finally:
             account_busy[idx] = False
             running_tasks.pop(task_id, None)
@@ -466,13 +474,16 @@ async def cancel_run_callback(c, q: CallbackQuery):
 async def kill_cmd(_, m: Message):
     if not is_authorized(m): 
         return
-    msg = await m.reply_text("🗑️ Saare notebooks delete aur active tasks cancel kar raha hoon...")
-    deleted = await asyncio.to_thread(kill_all_notebooks)
+    msg = await m.reply_text("🗑️ Saare active notebooks abort aur cache clean kar raha hoon...")
+    
+    # Local memory cancel triggers
     for tid in list(running_tasks.keys()):
         running_tasks[tid]["cancel"] = True
-    await msg.edit_text(f"✅ {len(deleted)} notebook(s) delete ho gaye aur processes cancel ho gayi hain.")
+        
+    deleted = await asyncio.to_thread(kill_all_notebooks)
+    await msg.edit_text(f"✅ Saare Active processes abort ho gayi hain!\n🧹 `{len(deleted)}` Kaggle notebook(s) successfully delete kiye gaye.")
 
-# ── HEALTH SERVER (Render Ke Liye) ───────────────────────────────────
+# ── HEALTH SERVER ────────────────────────────────────────────────────
 class Health(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -485,15 +496,15 @@ def run_health():
     port = int(os.environ.get("PORT", "8080"))
     http.server.HTTPServer(("0.0.0.0", port), Health).serve_forever()
 
-# ── MAIN SYSTEM STARTUP ──────────────────────────────────────────────
+# ── SYSTEM STARTUP ───────────────────────────────────────────────────
 async def main():
+    ensure_kaggle_installed()
     threading.Thread(target=run_health, daemon=True).start()
     await app.start()
     print("🚀 Controller Bot Connected successfully!")
 
-    # Startup cleanup to prevent double responses
     deleted = await asyncio.to_thread(kill_all_notebooks)
-    print(f"[startup] {len(deleted)} purane running kernels clean kiye gaye.")
+    print(f"[startup] {len(deleted)} active kernels successfully aborted.")
 
     workers = [asyncio.create_task(account_worker(acc)) for acc in KAG_ACCOUNTS]
     print(f"[startup] {len(KAG_ACCOUNTS)} Account workers successfully initiated.")
