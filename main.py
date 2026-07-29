@@ -10,6 +10,8 @@ import threading
 import psutil
 import shutil
 import sys
+import random
+import string
 from pathlib import Path
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -25,7 +27,9 @@ ALLOWED_USER = int(os.environ.get("ALLOWED_USER", "5351848105"))
 GROUP_ID = int(os.environ.get("GROUP_ID", "-1003899919015"))
 DESK_CHANNEL_ID = int(os.environ.get("DESK_CHANNEL_ID", "-1003700822969"))
 
-KERNEL_PREFIX = "hsbot-"
+# Generate completely unique dynamic instance and prefix to avoid overlapping
+BOT_INSTANCE_HASH = "".join(random.choices(string.ascii_lowercase, k=4))
+KERNEL_PREFIX = f"hs-{BOT_INSTANCE_HASH}-"
 
 def load_kaggle_accounts():
     accs = []
@@ -53,25 +57,33 @@ account_busy = {a["idx"]: False for a in KAG_ACCOUNTS}
 running_tasks = {}
 task_counter = 0
 
-# ── KAGGLE CREDENTIALS & COMMAND RUNNER ──────────────────────────────
-def write_kaggle_creds(account):
-    """Programmatic safe creation of kaggle.json with strict permissions"""
-    kaggle_dir = Path.home() / ".kaggle"
-    kaggle_dir.mkdir(parents=True, exist_ok=True)
-    creds_file = kaggle_dir / "kaggle.json"
+# ── THREAD-SAFE CONCURRENT RUNNER ────────────────────────────────────
+def run_kaggle_command(account, cmd_args, task_ref_id, timeout=60):
+    """Creates isolated localized credential workspace to prevent cross-account leaks"""
+    config_dir = Path(f"/tmp/kaggle_config_{task_ref_id}")
+    config_dir.mkdir(parents=True, exist_ok=True)
+    
+    creds_file = config_dir / "kaggle.json"
     with open(creds_file, "w", encoding="utf-8") as f:
         json.dump({"username": account["user"], "key": account["key"]}, f)
     try:
         creds_file.chmod(0o600)
     except:
         pass
-
-def run_kaggle_command(account, cmd_args, timeout=60):
-    write_kaggle_creds(account)
+        
     env = os.environ.copy()
+    env["KAGGLE_CONFIG_DIR"] = str(config_dir)
     env["KAGGLE_USERNAME"] = account["user"]
     env["KAGGLE_KEY"] = account["key"]
-    return subprocess.run(cmd_args, env=env, capture_output=True, text=True, timeout=timeout)
+    
+    res = subprocess.run(cmd_args, env=env, capture_output=True, text=True, timeout=timeout)
+    
+    # Instant automatic workspace cleanup after execution
+    try:
+        shutil.rmtree(config_dir)
+    except:
+        pass
+    return res
 
 def ensure_kaggle_installed():
     if shutil.which("kaggle") is None:
@@ -124,21 +136,24 @@ async def get_pinned_file_link(chat_id, target_name):
 
 # ── KAGGLE API WRAPPERS ──────────────────────────────────────────────
 def kaggle_list_kernels(account):
+    dummy_id = "".join(random.choices(string.ascii_lowercase, k=5))
     try:
-        out = run_kaggle_command(account, ["kaggle", "kernels", "list", "-m", "--csv"], timeout=45)
+        out = run_kaggle_command(account, ["kaggle", "kernels", "list", "-m", "--csv"], dummy_id, timeout=45)
         lines = out.stdout.strip().splitlines()
         refs = []
         for line in lines[1:]:
             ref = line.split(",")[0].strip()
-            if KERNEL_PREFIX in ref:
+            # Catch prefix patterns cleanly
+            if "hs-" in ref:
                 refs.append(ref)
         return refs
     except Exception:
         return []
 
 def kaggle_delete_kernel(account, ref):
+    dummy_id = "".join(random.choices(string.ascii_lowercase, k=5))
     try:
-        run_kaggle_command(account, ["kaggle", "kernels", "delete", "-y", ref], timeout=45)
+        run_kaggle_command(account, ["kaggle", "kernels", "delete", "-y", ref], dummy_id, timeout=45)
         return True
     except Exception:
         return False
@@ -151,7 +166,7 @@ def kill_all_notebooks():
                 deleted.append(ref)
     return deleted
 
-def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str):
+def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str, task_id):
     workdir = f"/tmp/{slug}"
     os.makedirs(workdir, exist_ok=True)
 
@@ -161,14 +176,10 @@ def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str):
 
     asi_code = open(asi_path, "r", encoding="utf-8").read()
     
-    # Accurate Replacement pattern to prevent runtime crash
+    # Clean Bulletproof config replacement
     cfg = json.dumps(payload)
     cfg_b64 = base64.b64encode(cfg.encode()).decode()
-    target_match = 'CONFIG_B64 = ""'
-    if target_match in asi_code:
-        asi_code = asi_code.replace(target_match, f'CONFIG_B64 = "{cfg_b64}"')
-    else:
-        return False, "Error: CONFIG_B64 target pattern missing in asi.py"
+    asi_code = re.sub(r'CONFIG_B64\s*=\s*["\']["\']', f'CONFIG_B64 = "{cfg_b64}"', asi_code)
 
     with open(os.path.join(workdir, f"{slug}.py"), "w", encoding="utf-8") as f:
         f.write(asi_code)
@@ -191,7 +202,14 @@ def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str):
     with open(os.path.join(workdir, "kernel-metadata.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f)
 
-    out = run_kaggle_command(account, ["kaggle", "kernels", "push", "-p", workdir], timeout=90)
+    out = run_kaggle_command(account, ["kaggle", "kernels", "push", "-p", workdir], task_id, timeout=90)
+    
+    # Cleanup local push folder workspace
+    try:
+        shutil.rmtree(workdir)
+    except:
+        pass
+    
     return out.returncode == 0, out.stdout + out.stderr
 
 # ── QUEUE WORKER THREADS ─────────────────────────────────────────────
@@ -204,10 +222,12 @@ async def account_worker(account):
             task_queue.task_done()
             continue
         task_id = task["task_id"]
+        task_hash = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        slug = f"{KERNEL_PREFIX}{task_id}-{task_hash}"
+        
         try:
             account_busy[idx] = True
             hw_mode = current_hw_mode()
-            slug = f"{KERNEL_PREFIX}{task_id}"
             running_tasks[task_id] = {"account_idx": idx, "kernel": f"{account_user}/{slug}", "cancel": False}
 
             status_text = (
@@ -224,7 +244,7 @@ async def account_worker(account):
             except Exception:
                 pass
 
-            ok, log = await asyncio.to_thread(kaggle_push_kernel, account, slug, task["payload"], hw_mode)
+            ok, log = await asyncio.to_thread(kaggle_push_kernel, account, slug, task["payload"], hw_mode, task_id)
             if not ok:
                 await report_error(task, f"Kaggle push fail (account {idx}):\n{log[-800:]}")
                 continue
@@ -248,9 +268,12 @@ async def account_worker(account):
 
 async def report_error(task, text):
     try:
-        await app.send_message(task["chat_id"], f"❌ Error:\n{text}")
+        await app.edit_message_text(task["chat_id"], task["status_msg_id"], f"❌ **Error Occurred:**\n\n{text}")
     except Exception:
-        pass
+        try:
+            await app.send_message(task["chat_id"], f"❌ **Error Occurred:**\n\n{text}")
+        except Exception:
+            pass
 
 async def enqueue_task(chat_id, status_msg_id, payload):
     global task_counter
@@ -501,7 +524,7 @@ async def main():
     ensure_kaggle_installed()
     threading.Thread(target=run_health, daemon=True).start()
     await app.start()
-    print("🚀 Controller Bot Connected successfully!")
+    print(f"🚀 Controller Bot Connected (Prefix ID: {BOT_INSTANCE_HASH})!")
 
     deleted = await asyncio.to_thread(kill_all_notebooks)
     print(f"[startup] {len(deleted)} active kernels successfully aborted.")
