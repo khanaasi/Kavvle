@@ -285,6 +285,9 @@ async def enqueue_task(chat_id, status_msg_id, payload):
     task_counter += 1
     task_id = task_counter
     payload["trigger_msg_id"] = str(status_msg_id)
+    payload["api_id"] = API_ID
+    payload["api_hash"] = API_HASH
+    payload["bot_token"] = BOT_TOKEN
     
     await task_queue.put({
         "task_id": task_id, "chat_id": chat_id,
