@@ -27,7 +27,7 @@ ALLOWED_USER = int(os.environ.get("ALLOWED_USER", "5351848105"))
 GROUP_ID = int(os.environ.get("GROUP_ID", "-1003899919015"))
 DESK_CHANNEL_ID = int(os.environ.get("DESK_CHANNEL_ID", "-1003700822969"))
 
-# Generate completely unique dynamic instance and prefix to avoid overlapping
+# Dynamic Instance Hash to avoid any metadata collision
 BOT_INSTANCE_HASH = "".join(random.choices(string.ascii_lowercase, k=4))
 KERNEL_PREFIX = f"hs-{BOT_INSTANCE_HASH}-"
 
@@ -57,9 +57,9 @@ account_busy = {a["idx"]: False for a in KAG_ACCOUNTS}
 running_tasks = {}
 task_counter = 0
 
-# ── THREAD-SAFE CONCURRENT RUNNER ────────────────────────────────────
+# ── THREAD-SAFE ISOLATED CONCURRENT COMMAND RUNNER ────────────────────
 def run_kaggle_command(account, cmd_args, task_ref_id, timeout=60):
-    """Creates isolated localized credential workspace to prevent cross-account leaks"""
+    """Creates temporary isolated workspace for kaggle.json to prevent race conditions"""
     config_dir = Path(f"/tmp/kaggle_config_{task_ref_id}")
     config_dir.mkdir(parents=True, exist_ok=True)
     
@@ -78,7 +78,7 @@ def run_kaggle_command(account, cmd_args, task_ref_id, timeout=60):
     
     res = subprocess.run(cmd_args, env=env, capture_output=True, text=True, timeout=timeout)
     
-    # Instant automatic workspace cleanup after execution
+    # Auto cleanup credentials path after use
     try:
         shutil.rmtree(config_dir)
     except:
@@ -143,7 +143,6 @@ def kaggle_list_kernels(account):
         refs = []
         for line in lines[1:]:
             ref = line.split(",")[0].strip()
-            # Catch prefix patterns cleanly
             if "hs-" in ref:
                 refs.append(ref)
         return refs
@@ -157,6 +156,14 @@ def kaggle_delete_kernel(account, ref):
         return True
     except Exception:
         return False
+
+def kaggle_kernel_status(account, ref):
+    dummy_id = "".join(random.choices(string.ascii_lowercase, k=5))
+    try:
+        out = run_kaggle_command(account, ["kaggle", "kernels", "status", ref], dummy_id, timeout=30)
+        return out.stdout.strip()
+    except Exception as e:
+        return str(e)
 
 def kill_all_notebooks():
     deleted = []
@@ -176,7 +183,6 @@ def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str, task_id):
 
     asi_code = open(asi_path, "r", encoding="utf-8").read()
     
-    # Clean Bulletproof config replacement
     cfg = json.dumps(payload)
     cfg_b64 = base64.b64encode(cfg.encode()).decode()
     asi_code = re.sub(r'CONFIG_B64\s*=\s*["\']["\']', f'CONFIG_B64 = "{cfg_b64}"', asi_code)
@@ -204,7 +210,6 @@ def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str, task_id):
 
     out = run_kaggle_command(account, ["kaggle", "kernels", "push", "-p", workdir], task_id, timeout=90)
     
-    # Cleanup local push folder workspace
     try:
         shutil.rmtree(workdir)
     except:
@@ -521,8 +526,11 @@ def run_health():
 
 # ── SYSTEM STARTUP ───────────────────────────────────────────────────
 async def main():
-    ensure_kaggle_installed()
+    # Render requirements: Bind port immediately before long execution steps
     threading.Thread(target=run_health, daemon=True).start()
+    print("📡 Web server bound to Render port successfully.")
+    
+    ensure_kaggle_installed()
     await app.start()
     print(f"🚀 Controller Bot Connected (Prefix ID: {BOT_INSTANCE_HASH})!")
 
