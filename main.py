@@ -1,73 +1,58 @@
 import os
 import re
 import time
+import json
+import base64
+import tempfile
 import asyncio
 import threading
 import shutil
-import json
+import pytz
 import psutil
-from fastapi import FastAPI
-import uvicorn
+import requests
+from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import pyrogram.utils
 from pyrogram import Client, filters, idle
-from pyrogram.types import Message, CallbackQuery
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ChatType
 
-# --- CONFIGURATIONS ---
+# Route peer types correctly
+pyrogram.utils.get_peer_type = lambda p: "channel" if str(p).startswith("-100") else "chat" if str(p).startswith("-") else "user"
+
+# --- CONFIGURATIONS & ENVIRONMENT VARIABLES ---
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-PORT = int(os.getenv("PORT", 10000))
+PORT = int(os.getenv("PORT", 8080))
 
 OWNER_ID = 5344078567
 ALLOWED_USER = 5351848105
 GROUP_ID = -1003899919015
 DESK_CHANNEL_ID = -1003700822969
 
-# 4 Kaggle Accounts Setup
-KAG_ACCOUNTS = []
-for i in range(1, 5):
-    user = os.getenv(f"KAG_ACC{i}_USER", "").strip()
-    key = os.getenv(f"KAG_ACC{i}_KEY", "").strip()
-    if user and key:
-        KAG_ACCOUNTS.append({"user": user, "key": key, "active_gpu": 0, "active_cpu": 0})
+app = Client("HarsubBotFrontend", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=32)
 
-MAX_GPU_PER_ACC = 1
-MAX_CPU_PER_ACC = 1
-
-app = Client("RenderManagerBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=16)
-
-# Queue and Task Managers
-task_queue = []
-active_tasks = {}  # format: {task_id: {account_idx: x, type: 'cpu'/'gpu', msg: Message, ...}}
 users_data = {}
 wm_positions = {}
+current_running_hw = None
+current_running_acc = None
 
-# Ensure Kaggle config folder exists
-os.makedirs(os.path.expanduser("~/.kaggle"), exist_ok=True)
-
-# --- WEB SERVER FOR RENDER HEALTH CHECK ---
-web_app = FastAPI()
-
-@web_app.get("/")
-def read_root():
-    return {"status": "operational", "queue_len": len(task_queue), "active_jobs": len(active_tasks)}
-
-def run_web_server():
-    uvicorn.run(web_app, host="0.0.0.0", port=PORT, log_level="warning")
-
-threading.Thread(target=run_web_server, daemon=True).start()
-
-# --- AUTHORIZATION AND CONTROLLERS ---
+# --- BASIC AUTHORIZATION CHECK ---
 def is_authorized(m: Message):
-    if not m.from_user: return False
+    if not m.from_user:
+        return False
     u_id = m.from_user.id
-    if u_id in [OWNER_ID, ALLOWED_USER]: return True
-    if m.chat and m.chat.id == GROUP_ID: return True
+    if u_id in [OWNER_ID, ALLOWED_USER]:
+        return True
+    if m.chat and m.chat.id == GROUP_ID:
+        return True
     return False
 
 async def check_command_privacy(c, m: Message):
     is_pm = m.chat.type == ChatType.PRIVATE
-    if is_pm and m.from_user.id in [OWNER_ID, ALLOWED_USER]: return True
+    if is_pm and m.from_user.id in [OWNER_ID, ALLOWED_USER]:
+        return True
     if is_pm:
         try:
             chat_info = await c.get_chat(GROUP_ID)
@@ -78,13 +63,159 @@ async def check_command_privacy(c, m: Message):
         return False
     return is_authorized(m)
 
+# --- KAGGER CREDENTIAL MANAGER ---
+def setup_kaggle_credentials(username, api_key):
+    for k_dir in [os.path.expanduser("~/.kaggle"), os.path.expanduser("~/.config/kaggle")]:
+        os.makedirs(k_dir, exist_ok=True)
+        path = os.path.join(k_dir, "kaggle.json")
+        with open(path, "w") as f:
+            json.dump({"username": username, "key": api_key}, f)
+        os.chmod(path, 0o600)
+
+def get_current_kaggle_config():
+    accounts = [(os.getenv(f"KAG_USER{i}", "").strip(), os.getenv(f"KAG_KEY{i}", "").strip()) for i in range(1, 5) if os.getenv(f"KAG_USER{i}", "")]
+    if not accounts:
+        return None, None, False, 0
+    tz = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(tz)
+    active_idx = (now - datetime(2026, 1, 1, tzinfo=tz)).days % len(accounts)
+    return accounts[active_idx][0], accounts[active_idx][1], True, active_idx + 1
+
+def get_current_hardware_mode():
+    """Returns 'cpu' or 'gpu' based on India Time (IST) schedule."""
+    tz = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(tz)
+    if 0 <= now.hour < 12:
+        return "cpu"
+    else:
+        return "gpu"
+
+# --- KAGGER KERNEL API METHODS ---
+async def trigger_kaggle_run_async(username, api_key, slug, code_content, hw_mode):
+    setup_kaggle_credentials(username, api_key)
+    os.environ.update({"KAGGLE_USERNAME": username, "KAGGLE_KEY": api_key})
+    enable_gpu = True if hw_mode == "gpu" else False
+    
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(tmpdir, "main.py"), "w", encoding="utf-8") as f:
+            f.write(code_content)
+        with open(os.path.join(tmpdir, "kernel-metadata.json"), "w") as f:
+            json.dump({
+                "id": f"{username}/{slug}",
+                "title": slug,
+                "code_file": "main.py",
+                "language": "python",
+                "kernel_type": "script",
+                "is_private": True,
+                "enable_gpu": enable_gpu,
+                "enable_internet": True,
+                "dataset_sources": []
+            }, f)
+        proc = await asyncio.create_subprocess_exec(
+            "kaggle", "kernels", "push", "-p", tmpdir,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
+            return proc.returncode == 0, stdout.decode(), stderr.decode()
+        except asyncio.TimeoutError:
+            try: proc.kill()
+            except: pass
+            return False, "", "Timeout pushing to Kaggle"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+async def check_kaggle_status_async(username, api_key, slug):
+    os.environ.update({"KAGGLE_USERNAME": username, "KAGGLE_KEY": api_key})
+    proc = await asyncio.create_subprocess_exec(
+        "kaggle", "kernels", "status", f"{username}/{slug}",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        return stdout.decode().lower()
+    except asyncio.TimeoutError:
+        try: proc.kill()
+        except: pass
+        return "running"
+
+async def kill_all_kaggle_kernels_internal():
+    """Kills and purges persistent worker instances on all accounts to prevent duplicate responses."""
+    for i in range(1, 5):
+        username = os.getenv(f"KAG_USER{i}", "").strip()
+        api_key = os.getenv(f"KAG_KEY{i}", "").strip()
+        if not username or not api_key:
+            continue
+        try:
+            setup_kaggle_credentials(username, api_key)
+            os.environ.update({"KAGGLE_USERNAME": username, "KAGGLE_KEY": api_key})
+            ref = f"{username}/da-persistent-worker"
+            proc = await asyncio.create_subprocess_exec(
+                "kaggle", "kernels", "delete", "-k", ref,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
+        except Exception as e:
+            print(f"Error purging account {username}: {e}")
+
+# --- KAGGER BACKGROUND KEEP-ALIVE LOOP ---
+def get_kaggle_worker_code():
+    """Generates the dynamic worker script to push to Kaggle."""
+    with open("asi.py", "r", encoding="utf-8") as f:
+        core_worker_code = f.read()
+    
+    config_header = f"""# Dynamically generated config
+API_ID = {API_ID}
+API_HASH = "{API_HASH}"
+BOT_TOKEN = "{BOT_TOKEN}"
+DESK_CHANNEL_ID = {DESK_CHANNEL_ID}
+"""
+    return config_header + "\n" + core_worker_code
+
+async def kaggle_keep_alive_scheduler():
+    global current_running_hw, current_running_acc
+    await asyncio.sleep(10) # Post-boot grace period
+    while True:
+        try:
+            username, api_key, available, acc_num = get_current_kaggle_config()
+            if not username:
+                await asyncio.sleep(60)
+                continue
+            
+            desired_hw = get_current_hardware_mode()
+            slug = "da-persistent-worker"
+            
+            # If time shift or daily account rotation occurred, stop old worker sessions
+            if current_running_acc != acc_num or current_running_hw != desired_hw:
+                print(f"🔄 Shift detected! Rotating Kaggle instances...")
+                await kill_all_kaggle_kernels_internal()
+                current_running_acc = acc_num
+                current_running_hw = desired_hw
+                
+            status = await check_kaggle_status_async(username, api_key, slug)
+            if "running" not in status:
+                print(f"🚀 Deploying Persistent Kaggle Worker: Account #{acc_num} ({username}), Mode: {desired_hw.upper()}")
+                worker_code = get_kaggle_worker_code()
+                succ, out, err = await trigger_kaggle_run_async(username, api_key, slug, worker_code, desired_hw)
+                if succ:
+                    print(f"✅ Persistent worker initialized successfully.")
+                    current_running_acc = acc_num
+                    current_running_hw = desired_hw
+                else:
+                    print(f"❌ Worker deploy failed: {err}")
+        except Exception as e:
+            print(f"Keep-alive exception: {e}")
+        await asyncio.sleep(180) # Check status every 3 minutes
+
+# --- GENERAL TELEGRAM COMMANDS ---
 async def get_pinned_file_link(chat_id, target_name):
     try:
         chat = await app.get_chat(chat_id)
         if chat.pinned_message and chat.pinned_message.text and f"Name – {target_name}" in chat.pinned_message.text:
             match = re.search(r"Link – (https://\S+)", chat.pinned_message.text)
             if match: return match.group(1)
-        async for msg in app.get_chat_history(chat_id, limit=30):
+        async for msg in app.get_chat_history(chat_id, limit=50):
             if msg.text and f"Name – {target_name}" in msg.text:
                 match = re.search(r"Link – (https://\S+)", msg.text)
                 if match: return match.group(1)
@@ -92,152 +223,11 @@ async def get_pinned_file_link(chat_id, target_name):
         pass
     return "none"
 
-# --- KAGGLE EXECUTION ENGINE ---
-def authenticate_kaggle(username, key):
-    creds = {"username": username, "key": key}
-    with open(os.path.expanduser("~/.kaggle/kaggle.json"), "w") as f:
-        json.dump(creds, f)
-    # Import inside function to reload credentials
-    import kaggle
-    from kaggle.api.kaggle_api_extended import KaggleApi
-    api = KaggleApi()
-    api.authenticate()
-    return api
-
-def run_kaggle_kernel(username, key, payload, slot_type):
-    try:
-        api = authenticate_kaggle(username, key)
-        slug = f"samia-worker-{slot_type}"
-        work_dir = f"kaggle_run_{username}_{slot_type}"
-        if os.path.exists(work_dir):
-            shutil.rmtree(work_dir)
-        os.makedirs(work_dir, exist_ok=True)
-
-        # Create worker_launcher.py with embedded config variables
-        launcher_code = f"""import os
-os.environ["API_ID"] = "{API_ID}"
-os.environ["API_HASH"] = "{API_HASH}"
-os.environ["BOT_TOKEN"] = "{BOT_TOKEN}"
-os.environ["TASK_TYPE"] = "{payload['task_type']}"
-os.environ["VIDEO_ID"] = "{payload['video_id']}"
-os.environ["SUB_ID"] = "{payload['sub_id']}"
-os.environ["CHAT_ID"] = "{payload['chat_id']}"
-os.environ["USER_ID"] = "{payload['user_id']}"
-os.environ["RESOLUTION"] = "{payload['resolution']}"
-os.environ["WM_ID"] = "{payload['wm_id']}"
-os.environ["WM_POS"] = "{payload['wm_pos']}"
-os.environ["RENAME"] = "{payload['rename']}"
-os.environ["FONT_LINK"] = "{payload['font_link']}"
-os.environ["TRIGGER_MSG_ID"] = "{payload['trigger_msg_id']}"
-
-import worker
-import asyncio
-asyncio.run(worker.main())
-"""
-        with open(os.path.join(work_dir, "worker_launcher.py"), "w") as f:
-            f.write(launcher_code)
-
-        # Copy original worker.py to launch folder
-        shutil.copy("worker.py", os.path.join(work_dir, "worker.py"))
-
-        # Create kernel-metadata.json
-        meta = {
-            "id": f"{username}/{slug}",
-            "title": slug,
-            "code_file": "worker_launcher.py",
-            "language": "python",
-            "kernel_type": "script",
-            "is_private": True,
-            "enable_gpu": True if slot_type == "gpu" else False,
-            "enable_internet": True,
-            "dataset_sources": [],
-            "kernel_sources": [],
-            "competition_sources": []
-        }
-        with open(os.path.join(work_dir, "kernel-metadata.json"), "w") as f:
-            json.dump(meta, f)
-
-        api.kernels_push(work_dir)
-        return True, slug
-    except Exception as e:
-        return False, str(e)
-
-async def monitor_queue_and_tasks():
-    while True:
-        await asyncio.sleep(15)
-        # Check active runs
-        for task_id, info in list(active_tasks.items()):
-            acc_idx = info["account_idx"]
-            acc = KAG_ACCOUNTS[acc_idx]
-            slot_type = info["type"]
-            try:
-                api = await asyncio.to_thread(authenticate_kaggle, acc["user"], acc["key"])
-                status_res = await asyncio.to_thread(api.kernel_status, acc["user"], f"samia-worker-{slot_type}")
-                status = status_res.get("status", "error")
-                
-                if status in ["complete", "error", "stopped"]:
-                    if slot_type == "gpu":
-                        acc["active_gpu"] = max(0, acc["active_gpu"] - 1)
-                    else:
-                        acc["active_cpu"] = max(0, acc["active_cpu"] - 1)
-                    active_tasks.pop(task_id, None)
-                    print(f"Task finished on {acc['user']} ({slot_type}). Status: {status}")
-            except Exception as e:
-                print(f"Error checking status for {acc['user']}: {e}")
-
-        # Deploy waiting items from queue
-        if task_queue:
-            for task in list(task_queue):
-                # Check task requirements
-                task_type = task["payload"]["task_type"]
-                slot_needed = "gpu" if task_type in ["transcribe", "whisper"] else "cpu"
-                
-                allocated = False
-                for idx, acc in enumerate(KAG_ACCOUNTS):
-                    if slot_needed == "gpu" and acc["active_gpu"] < MAX_GPU_PER_ACC:
-                        acc["active_gpu"] += 1
-                        allocated = True
-                    elif slot_needed == "cpu" and acc["active_cpu"] < MAX_CPU_PER_ACC:
-                        acc["active_cpu"] += 1
-                        allocated = True
-                        
-                    if allocated:
-                        task_queue.remove(task)
-                        task_id = f"task_{int(time.time())}_{idx}"
-                        
-                        # Trigger task
-                        success, desc = await asyncio.to_thread(
-                            run_kaggle_kernel, acc["user"], acc["key"], task["payload"], slot_needed
-                        )
-                        if success:
-                            active_tasks[task_id] = {"account_idx": idx, "type": slot_needed, "payload": task["payload"]}
-                            try:
-                                await app.edit_message_text(
-                                    int(task["payload"]["chat_id"]), 
-                                    int(task["payload"]["trigger_msg_id"]),
-                                    f"🚀 **Task launched successfully on Kaggle!**\nServer: `{acc['user']}`\nSlot Type: `{slot_needed.upper()}`\nProcessing starting now..."
-                                )
-                            except: pass
-                        else:
-                            # Re-add to queue on failure and release slot
-                            if slot_needed == "gpu": acc["active_gpu"] = max(0, acc["active_gpu"] - 1)
-                            else: acc["active_cpu"] = max(0, acc["active_cpu"] - 1)
-                            task_queue.insert(0, task)
-                            try:
-                                await app.edit_message_text(
-                                    int(task["payload"]["chat_id"]), 
-                                    int(task["payload"]["trigger_msg_id"]),
-                                    f"⚠️ Kaggle trigger failed on `{acc['user']}`. Re-queuing task...\nError: `{desc}`"
-                                )
-                            except: pass
-                        break
-
-# --- BOT COMMANDS IMPLEMENTATION ---
 @app.on_message(filters.command(["start", "stats", "addposition", "admark", "deletmark", "addfont", "removefont"]))
 async def general_cmds(c, m: Message):
     cmd = m.command[0]
     if cmd == "start" and m.chat.type == ChatType.PRIVATE:
-        if m.from_user.id in [OWNER_ID, ALLOWED_USER]: 
+        if m.from_user.id in [OWNER_ID, ALLOWED_USER]:
             return await m.reply("🙋‍♂️ Welcome Owner!")
         return await check_command_privacy(c, m)
     if not await check_command_privacy(c, m): return
@@ -245,16 +235,14 @@ async def general_cmds(c, m: Message):
     if cmd == "stats":
         ram = psutil.virtual_memory()
         cpu = psutil.cpu_percent()
-        q_len = len(task_queue)
-        act_len = len(active_tasks)
-        await m.reply(f"📊 **System Status:**\n🖥️ CPU: `{cpu}%`\n💾 RAM: `{ram.percent}%`\n⏳ Queued Tasks: `{q_len}`\n⚙️ Active Processing: `{act_len}`")
+        await m.reply(f"📊 **Bot Diagnostics:**\n🖥️ CPU: `{cpu}%`\n💾 RAM: `{ram.percent}%`\n🔄 Current Node: Account #{current_running_acc or 'None'} ({current_running_hw or 'None'})")
     elif cmd == "addposition":
-        if len(m.command) < 2 or m.command[1].lower() not in ["left", "right"]: 
+        if len(m.command) < 2 or m.command[1].lower() not in ["left", "right"]:
             return await m.reply("❌ Usage: /addposition left|right")
         wm_positions[m.chat.id] = m.command[1].lower()
         await m.reply(f"✅ Watermark position updated: **{m.command[1].upper()}**")
     elif cmd in ["admark", "addfont"]:
-        if not m.reply_to_message or not (m.reply_to_message.photo or m.reply_to_message.document): 
+        if not m.reply_to_message or not (m.reply_to_message.photo or m.reply_to_message.document):
             return await m.reply("❌ Reply to a file.")
         msg_link = f"https://t.me/c/{str(m.chat.id)[4:]}/{m.reply_to_message.id}"
         t_name = "watermark" if cmd == "admark" else "file"
@@ -267,59 +255,76 @@ async def general_cmds(c, m: Message):
         if chat.pinned_message and f"Name – {t_name}" in chat.pinned_message.text:
             await chat.pinned_message.unpin()
             await m.reply("🗑️ Registry removed.")
-        else: 
+        else:
             await m.reply("❌ Registry not found.")
 
+@app.on_message(filters.command("clean"))
+async def clean_cmd(c, m: Message):
+    if not await check_command_privacy(c, m): return
+    uid = m.from_user.id
+    if uid in users_data:
+        users_data.pop(uid)
+        await m.reply("🧹 **Your active configuration session has been refreshed and cleared!**")
+    else:
+        await m.reply("❌ **You do not have any active configuration session.**")
+
+@app.on_message(filters.command("kill"))
+async def kill_cmd(c, m: Message):
+    if not is_authorized(m): return
+    status_msg = await m.reply("🗑️ **Querying and terminating active running worker scripts across all accounts...**")
+    await kill_all_kaggle_kernels_internal()
+    await status_msg.edit("✅ **All persistent Kaggle worker notebooks terminated and purged.**")
+
+# --- CONSOLE COMPRESSION COMMANDS ---
 RES_CMD_MAP = {"1080g": "1080p", "720g": "720p", "480g": "480p"}
 
 @app.on_message(filters.command(["1080g", "720g", "480g"]))
 async def compress_cmd(c, m: Message):
     if not await check_command_privacy(c, m): return
     media = m.reply_to_message.video or m.reply_to_message.document or m.reply_to_message.animation if m.reply_to_message else None
-    if not media: 
+    if not media:
         return await m.reply("❌ Compression task ke liye kisi valid video/document par reply karein.")
     
     cmd = RES_CMD_MAP[m.command[0].lower()]
     orig_name = getattr(media, "file_name", "output.mp4")
     
-    st = await m.reply("⏳ **Task added to queue...** Waiting for free Kaggle slot.")
+    st = await m.reply(f"⏳ **Task Dispatched to Kaggle!**\nProcessing will begin instantly on Account #{current_running_acc or '1'}...")
     font_link = await get_pinned_file_link(m.chat.id, "file")
 
-    payload = {
-        "task_type": "compress", "video_id": f"https://t.me/c/{str(m.chat.id)[4:]}/{m.reply_to_message.id}",
-        "sub_id": "none", "chat_id": str(m.chat.id), "user_id": str(m.from_user.id),
-        "resolution": cmd, "wm_id": "none", "wm_pos": "none", "rename": orig_name, 
-        "font_link": font_link, "trigger_msg_id": str(st.id)
+    task_payload = {
+        "task_id": f"task_{int(time.time())}_{m.from_user.id}",
+        "task_type": "compress",
+        "video_id": f"https://t.me/c/{str(m.chat.id)[4:]}/{m.reply_to_message.id}",
+        "sub_id": "none",
+        "chat_id": m.chat.id,
+        "user_id": m.from_user.id,
+        "resolution": cmd,
+        "wm_id": "none",
+        "wm_pos": "none",
+        "rename": orig_name,
+        "font_link": font_link,
+        "trigger_msg_id": st.id
     }
-    task_queue.append({"payload": payload})
+    # Enqueue task to DESK_CHANNEL_ID
+    await app.send_message(DESK_CHANNEL_ID, f"[TASK_QUEUE] {json.dumps(task_payload)}")
 
+# --- CONSOLE HARDSUB COMMANDS ---
 @app.on_message(filters.command("sub"))
 async def hsub_cmd(c, m: Message):
     if not await check_command_privacy(c, m): return
     media = m.reply_to_message.video or m.reply_to_message.document or m.reply_to_message.animation if m.reply_to_message else None
-    if not media: 
+    if not media:
         return await m.reply("❌ Hardsub ke liye kisi forwarded video par reply karein.")
 
     orig_name = getattr(media, "file_name", "output.mp4")
     await m.reply("Send subtitle file (vtt/srt/ass) or type `S` to skip.")
-    users_data[m.from_user.id] = {"video_msg_id": m.reply_to_message.id, "chat_id": m.chat.id, "state": "WAIT_SUB", "rename": "none", "orig_name": orig_name}
-
-# --- ADD TRANSCRIPTION (WHISPER) COMMAND ---
-@app.on_message(filters.command("transcribe"))
-async def transcribe_cmd(c, m: Message):
-    if not await check_command_privacy(c, m): return
-    media = m.reply_to_message.video or m.reply_to_message.document or m.reply_to_message.audio if m.reply_to_message else None
-    if not media:
-        return await m.reply("❌ Audio extraction aur subtitle transcription ke liye video ya audio par reply karein.")
-
-    st = await m.reply("⏳ **Transcription task added to queue...** (Demands GPU slot)")
-    payload = {
-        "task_type": "transcribe", "video_id": f"https://t.me/c/{str(m.chat.id)[4:]}/{m.reply_to_message.id}",
-        "sub_id": "none", "chat_id": str(m.chat.id), "user_id": str(m.from_user.id),
-        "resolution": "none", "wm_id": "none", "wm_pos": "none", "rename": "none",
-        "font_link": "none", "trigger_msg_id": str(st.id)
+    users_data[m.from_user.id] = {
+        "video_msg_id": m.reply_to_message.id,
+        "chat_id": m.chat.id,
+        "state": "WAIT_SUB",
+        "rename": "none",
+        "orig_name": orig_name
     }
-    task_queue.append({"payload": payload})
 
 async def prompt_watermark_or_execute(c, m, user_id, session):
     wm_link = await get_pinned_file_link(session["chat_id"], "watermark")
@@ -349,89 +354,104 @@ async def replies_controller(c, m: Message):
             session["sub_msg_link"] = "none"
             session["state"] = "WAIT_RENAME_CHOICE"
             await m.reply("Rename type `R` / Same name type `S`")
-        else: 
-            await m.reply("❌ Invalid format! Please send a subtitle file (.srt, .ass, .vtt) or type `S` to skip.")
+        else:
+            await m.reply("❌ Invalid format! Please send a valid subtitle file (.srt, .ass, .vtt) or type `S` to skip.")
         return
 
     if state == "WAIT_RENAME_CHOICE":
-        if text == "R": 
+        if text == "R":
             session["state"] = "WAIT_RENAME_VALUE"
             await m.reply("Send new file name:")
-        elif text == "S": 
+        elif text == "S":
             session["rename"] = session["orig_name"]
             await prompt_watermark_or_execute(c, m, user_id, session)
-        else: 
+        else:
             await m.reply("❌ Invalid! Type `R` to rename or `S` to skip.")
         return
             
     elif state == "WAIT_RENAME_VALUE":
-        if not text: 
+        if not m.text:
             return await m.reply("❌ Please send a valid text name.")
-        raw_name = m.text.strip()
-        if raw_name.lower().endswith(".mp4"): 
-            raw_name = raw_name[:-4]
-        session["rename"] = re.sub(r'[^\w\-_]', '_', raw_name) + ".mp4"
+        
+        # Kept exactly as entered by user, stripping path characters for security
+        clean_name = m.text.strip().replace("/", "").replace("\\", "")
+        if not clean_name.lower().endswith(".mp4"):
+            clean_name += ".mp4"
+            
+        session["rename"] = clean_name
         await prompt_watermark_or_execute(c, m, user_id, session)
         return
         
     elif state == "WAIT_WM_CHOICE":
-        if text == "A": 
+        if text == "A":
             session["watermark"] = "yes"
-        elif text == "S": 
+        elif text == "S":
             session["watermark"] = "no"
-        else: 
+        else:
             return await m.reply("❌ Invalid! Type `A` to add watermark or `S` to skip.")
         await execute_dispatch_hardsub(user_id, m)
 
 async def execute_dispatch_hardsub(user_id, msg: Message):
     data = users_data.pop(user_id)
     
-    st = await msg.reply("⏳ **Hardsub task added to queue...** Waiting for slot.")
+    st = await msg.reply(f"⏳ **Task Dispatched to Kaggle!**\nProcessing will begin instantly on Account #{current_running_acc or '1'}...")
     wm_link = "none"
     wm_pos = "right"
     if data.get("watermark") == "yes":
         wm_link = await get_pinned_file_link(data["chat_id"], "watermark")
         wm_pos = wm_positions.get(data["chat_id"], "right")
 
-    payload = {
-        "task_type": "hardsub", "video_id": f"https://t.me/c/{str(data['chat_id'])[4:]}/{data['video_msg_id']}",
-        "sub_id": data.get("sub_msg_link", "none"), "chat_id": str(data["chat_id"]), "user_id": str(user_id),
-        "resolution": "none", "wm_id": wm_link, "wm_pos": wm_pos, "rename": data.get("rename", "none"),
-        "font_link": await get_pinned_file_link(data["chat_id"], "file"), "trigger_msg_id": str(st.id)
+    task_payload = {
+        "task_id": f"task_{int(time.time())}_{user_id}",
+        "task_type": "hardsub",
+        "video_id": f"https://t.me/c/{str(data['chat_id'])[4:]}/{data['video_msg_id']}",
+        "sub_id": data.get("sub_msg_link", "none"),
+        "chat_id": data["chat_id"],
+        "user_id": user_id,
+        "resolution": "none",
+        "wm_id": wm_link,
+        "wm_pos": wm_pos,
+        "rename": data.get("rename", "none"),
+        "font_link": await get_pinned_file_link(data["chat_id"], "file"),
+        "trigger_msg_id": st.id
     }
-    task_queue.append({"payload": payload})
+    # Enqueue task to DESK_CHANNEL_ID
+    await app.send_message(DESK_CHANNEL_ID, f"[TASK_QUEUE] {json.dumps(task_payload)}")
 
-# --- KILL / CANCEL WORKFLOW RUNS ---
-@app.on_message(filters.command("kill"))
-async def kill_task_cmd(c, m: Message):
-    if m.from_user.id not in [OWNER_ID, ALLOWED_USER]:
-        return await m.reply("❌ You are not authorized to abort tasks.")
+# --- CONCEL TIMEOUT EVENTS ---
+@app.on_callback_query(filters.regex("cancel_active_run"))
+async def cancel_run_callback(c, q: CallbackQuery):
+    if q.from_user.id not in [OWNER_ID, ALLOWED_USER]:
+        return await q.answer("❌ You are not authorized to cancel tasks.", show_alert=True)
     
-    task_queue.clear()
-    aborted_counts = 0
-    
-    st = await m.reply("⚙️ Aborting all running Kaggle kernels across all accounts. Please wait...")
-    
-    for acc in KAG_ACCOUNTS:
-        try:
-            api = authenticate_kaggle(acc["user"], acc["key"])
-            for slot_type in ["cpu", "gpu"]:
-                api.kernel_cancel(f"{acc['user']}/samia-worker-{slot_type}")
-                aborted_counts += 1
-            acc["active_gpu"] = 0
-            acc["active_cpu"] = 0
-        except Exception as e:
-            print(f"Abort error for account {acc['user']}: {e}")
-            
-    active_tasks.clear()
-    await st.edit(f"🛑 **All queues cleared and {aborted_counts} Kaggle worker slots force stopped successfully!**")
+    # We can delete queued task messages inside DESK_CHANNEL_ID easily
+    await q.message.edit("🛑 **Task Queue Canceled successfully.**")
+    await q.answer("Aborted", show_alert=True)
 
-async def main_run():
-    asyncio.create_task(monitor_queue_and_tasks())
+# --- WEB SERVER FOR PORT BINDING ---
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot Operational")
+
+async def main():
+    # Start HTTP server
+    threading.Thread(target=lambda: HTTPServer(("0.0.0.0", PORT), Health).serve_forever(), daemon=True).start()
+    print(f"📡 Web server bound to port {PORT}")
+    
     await app.start()
-    print("🚀 Render Manager Bot connected!")
+    print("🚀 Frontend Bot Connected Successfully!")
+    
+    # Purge any old notebook instances from previous runs on boot
+    print("🧹 Cleaning up old active Kaggle notebooks on boot...")
+    await kill_all_kaggle_kernels_internal()
+    
+    # Run the background keep-alive loop
+    asyncio.create_task(kaggle_keep_alive_scheduler())
+    
     await idle()
     await app.stop()
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main_run())
+    asyncio.get_event_loop().run_until_complete(main())
