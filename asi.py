@@ -200,16 +200,22 @@ def get_duration(video_path):
 # resolution ki zarurat hi nahi padti, chahe fresh session ho.
 async def download_by_file_id(app_instance, file_id, output_path, step_name):
     if not file_id or file_id == "none":
-        return None
+        # FIX: ab yeh batayega ki main.py se file_id hi nahi aaya (payload me "none" tha),
+        # generic "download failed" ki jagah exact wajah pata chalegi.
+        raise Exception(f"No file_id received for step '{step_name}' (payload me value 'none'/empty thi).")
     try:
         reset_prog()
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             app_instance.download_media(file_id, file_name=output_path, progress=prog, progress_args=(app_instance, step_name)),
             timeout=1800
         )
+        if not result or not os.path.exists(result):
+            raise Exception(f"download_media() ne khaali/invalid result diya step '{step_name}' ke liye.")
+        return result
     except Exception as e:
-        print(f"Download error tracking (file_id): {e}")
-    return None
+        # FIX: ab asli Pyrogram error (jaise FILE_REFERENCE_EXPIRED, FILE_ID_INVALID, etc.)
+        # print() me chupne ki jagah seedha raise hoti hai, jo Telegram tak pahunchti hai.
+        raise Exception(f"File download failed for '{step_name}': {type(e).__name__}: {e}")
 
 async def deliver_video_asset(app_instance, chat_id, target_user, file_path, caption, progress_callback):
     if not os.path.exists(file_path) or os.path.getsize(file_path) < 100:
