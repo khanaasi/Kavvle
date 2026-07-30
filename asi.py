@@ -191,27 +191,24 @@ def get_duration(video_path):
     except Exception:
         return 0.0
 
-async def download_tg_link(app_instance, link, output_path, step_name):
-    if not link or link == "none": 
+# FIX: Kaggle ka worker session har run par bilkul fresh hota hai — usne kabhi
+# GROUP_ID/CHAT_ID ko "dekha" nahi hota, isliye get_messages(CHAT_ID, msg_id) se
+# message resolve karna PEER_ID_INVALID jaisi error deta hai (jo pehle silently
+# swallow ho rahi thi -> generic "Telegram video download failed" dikhta tha).
+# Fix: main.py (jiska live session already us chat me hai) FILE_ID nikaal kar
+# bhejta hai, aur yahan seedha file_id se download hota hai — koi peer/chat
+# resolution ki zarurat hi nahi padti, chahe fresh session ho.
+async def download_by_file_id(app_instance, file_id, output_path, step_name):
+    if not file_id or file_id == "none":
         return None
     try:
-        msg_id = int(link.split("/")[-1])
-        msg = await app_instance.get_messages(CHAT_ID, msg_id)
-        if msg and (msg.document or msg.video or msg.photo or msg.animation):
-            ext = ""
-            if msg.document and msg.document.file_name: 
-                _, ext = os.path.splitext(msg.document.file_name)
-            elif msg.video and msg.video.file_name: 
-                _, ext = os.path.splitext(msg.video.file_name)
-            if ext and not output_path.endswith(ext.lower()): 
-                output_path += ext.lower()
-            reset_prog()
-            return await asyncio.wait_for(
-                msg.download(file_name=output_path, progress=prog, progress_args=(app_instance, step_name)),
-                timeout=1800
-            )
+        reset_prog()
+        return await asyncio.wait_for(
+            app_instance.download_media(file_id, file_name=output_path, progress=prog, progress_args=(app_instance, step_name)),
+            timeout=1800
+        )
     except Exception as e:
-        print(f"Download error tracking: {e}")
+        print(f"Download error tracking (file_id): {e}")
     return None
 
 async def deliver_video_asset(app_instance, chat_id, target_user, file_path, caption, progress_callback):
@@ -318,7 +315,7 @@ async def main_driver():
         status_msg_id = init_msg.id
 
     step_dl = "hardsub_download" if TASK_TYPE == "hardsub" else "compress_download"
-    video_file = await download_tg_link(app, VIDEO_ID, "video.mkv", step_dl)
+    video_file = await download_by_file_id(app, VIDEO_ID, "video.mkv", step_dl)
     if not video_file: 
         raise Exception("Telegram video download failed.")
 
@@ -331,18 +328,18 @@ async def main_driver():
 
     font_name = "Arial"
     if FONT_LINK and FONT_LINK != "none":
-        r = requests.get(FONT_LINK)
-        if r.status_code == 200:
-            with open("fonts/custom_font.ttf", "wb") as f: 
-                f.write(r.content)
-            font_name = get_font_name("fonts/custom_font.ttf")
+        # FONT_LINK ab ek Telegram file_id hai (pehle t.me link par requests.get()
+        # karta tha, jo kabhi kaam hi nahi karta tha), isliye same file_id path se download.
+        font_path = await download_by_file_id(app, FONT_LINK, "fonts/custom_font.ttf", step_dl)
+        if font_path and os.path.exists(font_path):
+            font_name = get_font_name(font_path)
 
     sub_file, wm_file, has_watermark = None, None, False
     extracted_subs = []
 
     if TASK_TYPE == "hardsub":
         if SUB_ID and SUB_ID != "none":
-            sub_file = await download_tg_link(app, SUB_ID, "sub_raw", "hardsub_download")
+            sub_file = await download_by_file_id(app, SUB_ID, "sub_raw", "hardsub_download")
         if not sub_file or not os.path.exists(sub_file): 
             raise Exception("Required subtitle file failed to download.")
 
@@ -386,7 +383,7 @@ async def main_driver():
             new_subs.save("ready_sub.ass")
 
         if WM_ID and WM_ID != "none" and not has_watermark:
-            wm_file = await download_tg_link(app, WM_ID, "watermark.png", "hardsub_download")
+            wm_file = await download_by_file_id(app, WM_ID, "watermark.png", "hardsub_download")
 
     await app.stop()  # Close Pyrogram downloads client before CPU/GPU stress starts
 
