@@ -1,24 +1,29 @@
-import os, re, json, base64, asyncio, subprocess, datetime, threading, psutil, shutil, sys, random, string
+import os, re, json, base64, asyncio, subprocess, datetime, http.server, threading, psutil, shutil, sys, random, string
 from pathlib import Path
-import pyrogram
+import pyrogram.utils
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ChatType
 
-# --- FASTAPI SERVER TO PREVENT RENDER/HF SUSPENSION ---
+# --- WHISPER FIX: PYROGRAM PEER ID BUG ---
+# Ye line Whisper file se li gayi hai jo (-100) channel IDs ko invalid hone se rokti hai.
+# Iske lagne se "Peer id invalid: -1003700822969" bilkul nahi aayega.
+pyrogram.utils.get_peer_type = lambda p: "channel" if str(p).startswith("-100") else "chat" if str(p).startswith("-") else "user"
+
+# --- WHISPER FIX: FASTAPI SERVER ---
+# Render par bot ko 24/7 zinda rakhne ke liye lightweight heartbeat server. 
 from fastapi import FastAPI
 import uvicorn
-
 web_app = FastAPI()
 
 @web_app.get("/")
 def read_root():
-    return {"status": "Kavvle System Manager is online", "timestamp": str(datetime.datetime.now())}
+    return {"status": "Kavvle Controller Live"}
 
 def run_web_server():
     port = int(os.environ.get("PORT", "7860"))
     uvicorn.run(web_app, host="0.0.0.0", port=port, log_level="warning")
-# --------------------------------------------------------
+# ------------------------------------
 
 # ── CONFIGURATION & ENVIRONMENT ──────────────────────────────────────
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -62,7 +67,6 @@ task_counter = 0
 
 # ── THREAD-SAFE ISOLATED CONCURRENT COMMAND RUNNER ────────────────────
 def run_kaggle_command(account, cmd_args, task_ref_id, timeout=60):
-    """Creates temporary isolated workspace for kaggle.json to prevent race conditions"""
     config_dir = Path(f"/tmp/kaggle_config_{task_ref_id}")
     config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -71,7 +75,6 @@ def run_kaggle_command(account, cmd_args, task_ref_id, timeout=60):
         json.dump({"username": account["user"], "key": account["key"]}, f)
     try:
         creds_file.chmod(0o600)
-        config_dir.chmod(0o700)
     except:
         pass
 
@@ -122,7 +125,6 @@ async def check_command_privacy(c, m: Message):
     return is_authorized(m)
 
 async def get_pinned_file_link(chat_id, target_name):
-    """Retrieves pinned file links from registries."""
     try:
         chat = await app.get_chat(chat_id)
         if chat.pinned_message and chat.pinned_message.text and f"Name – {target_name}" in chat.pinned_message.text:
@@ -139,7 +141,6 @@ async def get_pinned_file_link(chat_id, target_name):
     return "none"
 
 async def copy_pinned_file_to_desk(chat_id, target_name):
-    """Resolves and mirrors pinned registry content to safe log channel for secure access."""
     link = await get_pinned_file_link(chat_id, target_name)
     if link == "none":
         return "none"
@@ -166,7 +167,6 @@ def kaggle_list_kernels_verbose(account):
             parts = line.split(",")
             if parts:
                 ref = parts[0].strip()
-                # Targets specifically "hs-" prefix to kill orphaned runs flawlessly
                 if "hs-" in ref:
                     refs.append(ref)
         return refs, None
@@ -192,7 +192,6 @@ def kaggle_kernel_status(account, ref):
         return str(e)
 
 def kill_all_notebooks_verbose():
-    """Identical clean/purge loop style implemented based on tested Whisper bot structure"""
     deleted, errors = [], []
     for acc in KAG_ACCOUNTS:
         refs, err = kaggle_list_kernels_verbose(acc)
@@ -206,14 +205,6 @@ def kill_all_notebooks_verbose():
             else:
                 errors.append(derr)
     return deleted, errors
-
-def kaggle_delete_kernel(account, ref):
-    ok, _ = kaggle_delete_kernel_verbose(account, ref)
-    return ok
-
-def kill_all_notebooks():
-    deleted, _ = kill_all_notebooks_verbose()
-    return deleted
 
 def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str, task_id):
     workdir = f"/tmp/{slug}"
@@ -259,6 +250,10 @@ def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str, task_id):
         pass
 
     return out.returncode == 0, out.stdout + out.stderr
+
+def kaggle_delete_kernel(account, ref):
+    ok, _ = kaggle_delete_kernel_verbose(account, ref)
+    return ok
 
 # ── QUEUE WORKER THREADS ─────────────────────────────────────────────
 async def account_worker(account):
@@ -586,21 +581,18 @@ async def kill_cmd(_, m: Message):
     if not KAG_ACCOUNTS:
         return await m.reply_text("❌ Koi Kaggle account configured nahi hai.")
 
-    msg = await m.reply_text("🔄 **Querying active instances from all Kaggle accounts...**")
+    msg = await m.reply_text("🗑️ Saare active notebooks abort aur cache clean kar raha hoon...")
 
-    # Set internal soft cancel variables (stops API checks if running)
     for tid in list(running_tasks.keys()):
         running_tasks[tid]["cancel"] = True
 
-    # Uses precisely modeled threading deletion exactly like Whisper
     deleted, errors = await asyncio.to_thread(kill_all_notebooks_verbose)
 
-    text = f"✅ `{len(deleted)}` Kaggle notebook(s) successfully aborted & purged."
+    text = f"✅ `{len(deleted)}` Kaggle notebook(s) delete kiye gaye."
     if deleted:
-        text += "\n\n**Deleted Kernels:**\n" + "\n".join(f"• `{d}`" for d in deleted[:15])
+        text += "\n" + "\n".join(f"• `{d}`" for d in deleted[:15])
     if errors:
         text += "\n\n⚠️ **Errors:**\n" + "\n".join(f"• {e}" for e in errors[:6])
-    
     await msg.edit_text(text)
 
 @app.on_message(filters.command("clean"))
@@ -610,7 +602,7 @@ async def clean_cmd(_, m: Message):
     had = users_data.pop(m.from_user.id, None)
     await m.reply_text("🔄 **Session refreshed.** Pichla /sub flow reset ho gaya." if had else "🔄 **Already clean.**")
 
-# ── SYSTEM STARTUP WITH FLOODWAIT HANDLER ────────────────────────────
+# ── SYSTEM STARTUP ───────────────────────────────────────────────────
 if __name__ == "__main__":
     from pyrogram.errors import FloodWait
 
@@ -623,7 +615,7 @@ if __name__ == "__main__":
             await app.start()
             print(f"🚀 Controller Bot Connected (Prefix ID: {BOT_INSTANCE_HASH})!")
 
-            deleted = await asyncio.to_thread(kill_all_notebooks)
+            deleted, _ = await asyncio.to_thread(kill_all_notebooks_verbose)
             print(f"[startup] {len(deleted)} active kernels successfully aborted.")
 
             for acc in KAG_ACCOUNTS:
@@ -632,7 +624,7 @@ if __name__ == "__main__":
 
             await pyrogram.idle()
             await app.stop()
-
+            
         except FloodWait as e:
             print(f"⚠️ Telegram FloodWait triggered! Sleeping for {e.value} seconds to clear rate limit.")
             await asyncio.sleep(e.value + 10)
