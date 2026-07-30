@@ -4,7 +4,7 @@ import os, sys, time, json, base64, asyncio, re, subprocess, requests, html, shu
 CONFIG_B64 = ""
 
 def report_critical_failure(error_msg):
-    """Raw immediate HTTP traceback logger directly to user telegram chat"""
+    """Immediate HTTP traceback logger directly to user telegram chat"""
     try:
         token = os.environ.get("BOT_TOKEN")
         chat_id = os.environ.get("CHAT_ID")
@@ -45,15 +45,18 @@ try:
     API_HASH = CFG["api_hash"]
     BOT_TOKEN = CFG["bot_token"]
     TASK_TYPE = CFG["task_type"]
-    VIDEO_ID = CFG["video_id"]
-    SUB_ID = CFG.get("sub_id", "none")
+    
+    # Message Mirror IDs
+    VIDEO_MSG_ID = CFG.get("video_msg_id", "none")
+    SUB_MSG_ID = CFG.get("sub_msg_id", "none")
+    WM_MSG_ID = CFG.get("wm_msg_id", "none")
+    FONT_MSG_ID = CFG.get("font_msg_id", "none")
+    
     CHAT_ID = int(CFG["chat_id"])
     USER_ID = int(CFG.get("user_id") or CFG["chat_id"])
     RESOLUTION = CFG.get("resolution", "none")
-    WM_ID = CFG.get("wm_id", "none")
     WM_POS = CFG.get("wm_pos", "right")
     RENAME = CFG.get("rename", "none")
-    FONT_LINK = CFG.get("font_link", "none")
     TRIGGER_MSG_ID = CFG.get("trigger_msg_id")
 
     DESK_CHANNEL_ID = -1003700822969
@@ -191,18 +194,35 @@ def get_duration(video_path):
     except Exception:
         return 0.0
 
-# FIX: Kaggle ka worker session har run par bilkul fresh hota hai — usne kabhi
-# GROUP_ID/CHAT_ID ko "dekha" nahi hota, isliye get_messages(CHAT_ID, msg_id) se
-# message resolve karna PEER_ID_INVALID jaisi error deta hai (jo pehle silently
-# swallow ho rahi thi -> generic "Telegram video download failed" dikhta tha).
-# Fix: main.py (jiska live session already us chat me hai) FILE_ID nikaal kar
-# bhejta hai, aur yahan seedha file_id se download hota hai — koi peer/chat
-# resolution ki zarurat hi nahi padti, chahe fresh session ho.
+async def download_message_asset(app_instance, msg_id_str, output_path, step_name):
+    """Downloads mirrored files using message object from the logging channel."""
+    if not msg_id_str or msg_id_str == "none":
+        return None
+    try:
+        msg_id = int(msg_id_str)
+        msg = await app_instance.get_messages(DESK_CHANNEL_ID, msg_id)
+        if not msg:
+            raise Exception(f"Mirrored asset {msg_id} was removed from logging channel.")
+        
+        media = msg.document or msg.video or msg.audio or msg.photo or msg.animation
+        if not media:
+            raise Exception("No valid downloadable stream in secured message.")
+            
+        reset_prog()
+        result = await asyncio.wait_for(
+            app_instance.download_media(msg, file_name=output_path, progress=prog, progress_args=(app_instance, step_name)),
+            timeout=1800
+        )
+        if not result or not os.path.exists(result):
+            raise Exception("Mirrored file failed to write successfully.")
+        return result
+    except Exception as e:
+        raise Exception(f"Download Error on secured step '{step_name}': {type(e).__name__}: {e}")
+
 async def download_by_file_id(app_instance, file_id, output_path, step_name):
+    """Direct raw file identifier download fallback mechanism."""
     if not file_id or file_id == "none":
-        # FIX: ab yeh batayega ki main.py se file_id hi nahi aaya (payload me "none" tha),
-        # generic "download failed" ki jagah exact wajah pata chalegi.
-        raise Exception(f"No file_id received for step '{step_name}' (payload me value 'none'/empty thi).")
+        return None
     try:
         reset_prog()
         result = await asyncio.wait_for(
@@ -210,16 +230,21 @@ async def download_by_file_id(app_instance, file_id, output_path, step_name):
             timeout=1800
         )
         if not result or not os.path.exists(result):
-            raise Exception(f"download_media() ne khaali/invalid result diya step '{step_name}' ke liye.")
+            raise Exception("File path failed to register on fallback.")
         return result
     except Exception as e:
-        # FIX: ab asli Pyrogram error (jaise FILE_REFERENCE_EXPIRED, FILE_ID_INVALID, etc.)
-        # print() me chupne ki jagah seedha raise hoti hai, jo Telegram tak pahunchti hai.
-        raise Exception(f"File download failed for '{step_name}': {type(e).__name__}: {e}")
+        raise Exception(f"Fallback download failed on '{step_name}': {type(e).__name__}: {e}")
+
+async def download_asset_robust(app_instance, val, output_path, step_name):
+    if not val or val == "none":
+        return None
+    if str(val).isdigit():
+        return await download_message_asset(app_instance, val, output_path, step_name)
+    return await download_by_file_id(app_instance, val, output_path, step_name)
 
 async def deliver_video_asset(app_instance, chat_id, target_user, file_path, caption, progress_callback):
     if not os.path.exists(file_path) or os.path.getsize(file_path) < 100:
-        raise Exception("Processed video missing or empty size.")
+        raise Exception("Processed output file was empty or missing.")
     
     thumb_path = "thumb.jpg"
     try:
@@ -293,7 +318,7 @@ def encode_with_fallback(base_cmd_gpu, base_cmd_cpu, duration, title):
         rc, log = run_ffmpeg_sync(base_cmd_gpu, duration, title + " (GPU)")
         if rc == 0:
             return
-        _sync_http_edit(f"⚠️ GPU processing fail. Switching to CPU encoding...")
+        _sync_http_edit(f"⚠️ GPU fallback activated. Switching to CPU encoding...")
     rc, log = run_ffmpeg_sync(base_cmd_cpu, duration, title + " (CPU)")
     if rc != 0:
         raise Exception("FFmpeg command crashed on execution.\n" + "\n".join(log[-8:]))
@@ -302,10 +327,6 @@ def encode_with_fallback(base_cmd_gpu, base_cmd_cpu, duration, title):
 async def main_driver():
     global status_msg_id
 
-    # FIX: in_memory=True stops Pyrogram from creating a .session sqlite file on disk.
-    # Kaggle's script working dir (/kaggle/src) is read-only, which caused:
-    #   sqlite3.OperationalError: unable to open database file
-    # Bot-token sessions don't need to persist across runs, so in-memory storage is safe here.
     app = Client("worker_down", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, 
                  workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
     await app.start()
@@ -321,7 +342,7 @@ async def main_driver():
         status_msg_id = init_msg.id
 
     step_dl = "hardsub_download" if TASK_TYPE == "hardsub" else "compress_download"
-    video_file = await download_by_file_id(app, VIDEO_ID, "video.mkv", step_dl)
+    video_file = await download_asset_robust(app, VIDEO_MSG_ID, "video.mkv", step_dl)
     if not video_file: 
         raise Exception("Telegram video download failed.")
 
@@ -333,10 +354,8 @@ async def main_driver():
     out_name = f"{base_name}.mp4"
 
     font_name = "Arial"
-    if FONT_LINK and FONT_LINK != "none":
-        # FONT_LINK ab ek Telegram file_id hai (pehle t.me link par requests.get()
-        # karta tha, jo kabhi kaam hi nahi karta tha), isliye same file_id path se download.
-        font_path = await download_by_file_id(app, FONT_LINK, "fonts/custom_font.ttf", step_dl)
+    if FONT_MSG_ID and FONT_MSG_ID != "none":
+        font_path = await download_asset_robust(app, FONT_MSG_ID, "fonts/custom_font.ttf", step_dl)
         if font_path and os.path.exists(font_path):
             font_name = get_font_name(font_path)
 
@@ -344,8 +363,8 @@ async def main_driver():
     extracted_subs = []
 
     if TASK_TYPE == "hardsub":
-        if SUB_ID and SUB_ID != "none":
-            sub_file = await download_by_file_id(app, SUB_ID, "sub_raw", "hardsub_download")
+        if SUB_MSG_ID and SUB_MSG_ID != "none":
+            sub_file = await download_asset_robust(app, SUB_MSG_ID, "sub_raw", "hardsub_download")
         if not sub_file or not os.path.exists(sub_file): 
             raise Exception("Required subtitle file failed to download.")
 
@@ -360,7 +379,7 @@ async def main_driver():
             if any(word in ass_content.lower() for word in ["logo", "watermark", "cr", "credit"]): 
                 has_watermark = True
 
-            if FONT_LINK and FONT_LINK != "none":
+            if FONT_MSG_ID and FONT_MSG_ID != "none":
                 lines = ass_content.splitlines()
                 new_lines = []
                 for line in lines:
@@ -388,8 +407,8 @@ async def main_driver():
                     new_subs.append(pysubs2.SSAEvent(start=line.start, end=line.end, text=clean_text, style="Default"))
             new_subs.save("ready_sub.ass")
 
-        if WM_ID and WM_ID != "none" and not has_watermark:
-            wm_file = await download_by_file_id(app, WM_ID, "watermark.png", "hardsub_download")
+        if WM_MSG_ID and WM_MSG_ID != "none" and not has_watermark:
+            wm_file = await download_asset_robust(app, WM_MSG_ID, "watermark.png", "hardsub_download")
 
     await app.stop()  # Close Pyrogram downloads client before CPU/GPU stress starts
 
@@ -446,7 +465,7 @@ async def main_driver():
 
     elif TASK_TYPE == "hardsub":
         vf_filter = "subtitles='ready_sub.ass':charenc=UTF-8"
-        if FONT_LINK and FONT_LINK != "none": 
+        if FONT_MSG_ID and FONT_MSG_ID != "none": 
             vf_filter += ":fontsdir=fonts"
         v_filter = f"scale='trunc(iw/2)*2:trunc(ih/2)*2',{vf_filter}"
         overlay_coord = "W-w-15:15" if WM_POS == "right" else "15:15"
