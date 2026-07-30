@@ -1,17 +1,4 @@
-import os
-import re
-import json
-import base64
-import asyncio
-import subprocess
-import datetime
-import http.server
-import threading
-import psutil
-import shutil
-import sys
-import random
-import string
+import os, re, json, base64, asyncio, subprocess, datetime, http.server, threading, psutil, shutil, sys, random, string
 from pathlib import Path
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -62,7 +49,7 @@ def run_kaggle_command(account, cmd_args, task_ref_id, timeout=60):
     """Creates temporary isolated workspace for kaggle.json to prevent race conditions"""
     config_dir = Path(f"/tmp/kaggle_config_{task_ref_id}")
     config_dir.mkdir(parents=True, exist_ok=True)
-    
+
     creds_file = config_dir / "kaggle.json"
     with open(creds_file, "w", encoding="utf-8") as f:
         json.dump({"username": account["user"], "key": account["key"]}, f)
@@ -70,15 +57,14 @@ def run_kaggle_command(account, cmd_args, task_ref_id, timeout=60):
         creds_file.chmod(0o600)
     except:
         pass
-        
+
     env = os.environ.copy()
     env["KAGGLE_CONFIG_DIR"] = str(config_dir)
     env["KAGGLE_USERNAME"] = account["user"]
     env["KAGGLE_KEY"] = account["key"]
-    
+
     res = subprocess.run(cmd_args, env=env, capture_output=True, text=True, timeout=timeout)
-    
-    # Auto cleanup credentials path after use
+
     try:
         shutil.rmtree(config_dir)
     except:
@@ -95,43 +81,65 @@ def current_hw_mode():
     return "cpu" if 0 <= ist.hour < 12 else "gpu"
 
 def is_authorized(m: Message):
-    if not m.from_user: 
+    if not m.from_user:
         return False
     u_id = m.from_user.id
-    if u_id in [OWNER_ID, ALLOWED_USER]: 
+    if u_id in [OWNER_ID, ALLOWED_USER]:
         return True
-    if m.chat and m.chat.id == GROUP_ID: 
+    if m.chat and m.chat.id == GROUP_ID:
         return True
     return False
 
 async def check_command_privacy(c, m: Message):
     is_pm = m.chat.type == ChatType.PRIVATE
-    if is_pm and m.from_user.id in [OWNER_ID, ALLOWED_USER]: 
+    if is_pm and m.from_user.id in [OWNER_ID, ALLOWED_USER]:
         return True
     if is_pm:
-        try: 
+        try:
             chat_info = await c.get_chat(GROUP_ID)
             invite_link = chat_info.invite_link or "https://t.me/Mangajii"
-        except: 
+        except:
             invite_link = "https://t.me/Mangajii"
         await m.reply(f"❌ **Aap is Bot ko Private mein use nahi kar sakte!**\n\n👉 Humara [Official Group]({invite_link}) join karein.", disable_web_page_preview=True)
         return False
     return is_authorized(m)
 
 async def get_pinned_file_link(chat_id, target_name):
+    """Pinned registry text se link nikalta hai (backward compatible helper)."""
     try:
         chat = await app.get_chat(chat_id)
         if chat.pinned_message and chat.pinned_message.text and f"Name – {target_name}" in chat.pinned_message.text:
             match = re.search(r"Link – (https://\S+)", chat.pinned_message.text)
-            if match: 
+            if match:
                 return match.group(1)
         async for msg in app.get_chat_history(chat_id, limit=50):
             if msg.text and f"Name – {target_name}" in msg.text:
                 match = re.search(r"Link – (https://\S+)", msg.text)
-                if match: 
+                if match:
                     return match.group(1)
-    except: 
+    except:
         pass
+    return "none"
+
+# ── FIX: FILE_ID RESOLVER ─────────────────────────────────────────────
+# Root cause of "Telegram video download failed": Kaggle ka worker session
+# har run par bilkul FRESH hota hai, usne kabhi GROUP_ID ko dekha nahi hota,
+# isliye wahan se seedha get_messages(chat_id, msg_id) call karna peer
+# resolution error deta hai. Fix: main.py ka apna LIVE session (jo already
+# us group me active hai) file_id nikaal ke Kaggle ko bhejta hai — file_id
+# se download karne ke liye kisi peer/chat resolution ki zarurat nahi padti.
+async def get_pinned_file_id(chat_id, target_name):
+    link = await get_pinned_file_link(chat_id, target_name)
+    if link == "none":
+        return "none"
+    try:
+        msg_id = int(link.rstrip("/").split("/")[-1])
+        msg = await app.get_messages(chat_id, msg_id)
+        media = msg.document or msg.video or msg.photo or msg.animation if msg else None
+        if media:
+            return media.file_id
+    except Exception as e:
+        print(f"[get_pinned_file_id] resolve fail: {e}")
     return "none"
 
 # ── KAGGLE API WRAPPERS ──────────────────────────────────────────────
@@ -182,7 +190,8 @@ def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str, task_id):
         return False, "Error: asi.py template missing on controller!"
 
     asi_code = open(asi_path, "r", encoding="utf-8").read()
-    
+
+    payload["hardware_mode"] = hw_mode
     cfg = json.dumps(payload)
     cfg_b64 = base64.b64encode(cfg.encode()).decode()
     asi_code = re.sub(r'CONFIG_B64\s*=\s*["\']["\']', f'CONFIG_B64 = "{cfg_b64}"', asi_code)
@@ -209,12 +218,12 @@ def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str, task_id):
         json.dump(meta, f)
 
     out = run_kaggle_command(account, ["kaggle", "kernels", "push", "-p", workdir], task_id, timeout=90)
-    
+
     try:
         shutil.rmtree(workdir)
     except:
         pass
-    
+
     return out.returncode == 0, out.stdout + out.stderr
 
 # ── QUEUE WORKER THREADS ─────────────────────────────────────────────
@@ -229,7 +238,7 @@ async def account_worker(account):
         task_id = task["task_id"]
         task_hash = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
         slug = f"{KERNEL_PREFIX}{task_id}-{task_hash}"
-        
+
         try:
             account_busy[idx] = True
             hw_mode = current_hw_mode()
@@ -288,17 +297,17 @@ async def enqueue_task(chat_id, status_msg_id, payload):
     payload["api_id"] = API_ID
     payload["api_hash"] = API_HASH
     payload["bot_token"] = BOT_TOKEN
-    
+
     await task_queue.put({
         "task_id": task_id, "chat_id": chat_id,
         "status_msg_id": status_msg_id, "payload": payload
     })
-    
+
     pos = task_queue.qsize()
     if pos > 0:
         try:
             await app.edit_message_text(
-                chat_id, status_msg_id, 
+                chat_id, status_msg_id,
                 f"⏳ **Task Queued!**\n\n🔢 **Queue Position:** `{pos}`\nServer abhi busy hai, aapka task queue me lag gaya hai."
             )
         except Exception:
@@ -310,10 +319,10 @@ async def enqueue_task(chat_id, status_msg_id, payload):
 async def general_cmds(c, m: Message):
     cmd = m.command[0]
     if cmd == "start" and m.chat.type == ChatType.PRIVATE:
-        if m.from_user.id in [OWNER_ID, ALLOWED_USER]: 
+        if m.from_user.id in [OWNER_ID, ALLOWED_USER]:
             return await m.reply("🙋‍♂️ Welcome Owner!")
         return await check_command_privacy(c, m)
-    if not await check_command_privacy(c, m): 
+    if not await check_command_privacy(c, m):
         return
 
     if cmd == "stats":
@@ -330,12 +339,12 @@ async def general_cmds(c, m: Message):
             f"⚡ Active HW Mode: `{current_hw_mode().upper()}`"
         )
     elif cmd == "addposition":
-        if len(m.command) < 2 or m.command[1].lower() not in ["left", "right"]: 
+        if len(m.command) < 2 or m.command[1].lower() not in ["left", "right"]:
             return await m.reply("❌ Usage: `/addposition left|right`")
         wm_positions[m.chat.id] = m.command[1].lower()
         await m.reply(f"✅ Watermark position updated: **{m.command[1].upper()}**")
     elif cmd in ["admark", "addfont"]:
-        if not m.reply_to_message or not (m.reply_to_message.photo or m.reply_to_message.document): 
+        if not m.reply_to_message or not (m.reply_to_message.photo or m.reply_to_message.document):
             return await m.reply("❌ Reply to a valid file/image.")
         msg_link = f"https://t.me/c/{str(m.chat.id)[4:]}/{m.reply_to_message.id}"
         t_name = "watermark" if cmd == "admark" else "file"
@@ -348,7 +357,7 @@ async def general_cmds(c, m: Message):
         if chat.pinned_message and f"Name – {t_name}" in chat.pinned_message.text:
             await chat.pinned_message.unpin()
             await m.reply("🗑️ Registry successfully removed.")
-        else: 
+        else:
             await m.reply("❌ Registry not found.")
 
 # ── COMPRESS COMMANDS ────────────────────────────────────────────────
@@ -356,23 +365,23 @@ RES_CMD_MAP = {"1080g": "1080p", "720g": "720p", "480g": "480p"}
 
 @app.on_message(filters.command(["1080g", "720g", "480g"]))
 async def compress_cmd(c, m: Message):
-    if not await check_command_privacy(c, m): 
+    if not await check_command_privacy(c, m):
         return
     media = m.reply_to_message.video or m.reply_to_message.document or m.reply_to_message.animation if m.reply_to_message else None
-    if not media: 
+    if not media:
         return await m.reply("❌ Compression task ke liye kisi valid video/document par reply karein.")
-    
+
     cmd = RES_CMD_MAP[m.command[0].lower()]
     orig_name = getattr(media, "file_name", "output.mp4")
-    
+
     st = await m.reply("⏳ **Task Registered!** Queue me insert kiya jaa raha hai...")
-    font_link = await get_pinned_file_link(m.chat.id, "file")
+    font_link = await get_pinned_file_id(m.chat.id, "file")
 
     payload = {
-        "task_type": "compress", 
-        "video_id": f"https://t.me/c/{str(m.chat.id)[4:]}/{m.reply_to_message.id}",
+        "task_type": "compress",
+        "video_id": media.file_id,  # FIX: file_id, not a t.me link
         "sub_id": "none", "chat_id": str(m.chat.id), "user_id": str(m.from_user.id),
-        "resolution": cmd, "wm_id": "none", "wm_pos": "none", "rename": orig_name, 
+        "resolution": cmd, "wm_id": "none", "wm_pos": "none", "rename": orig_name,
         "font_link": font_link, "trigger_msg_id": str(st.id)
     }
     await enqueue_task(m.chat.id, st.id, payload)
@@ -380,24 +389,25 @@ async def compress_cmd(c, m: Message):
 # ── HARDSUB INTERACTIVE WORKFLOW ─────────────────────────────────────
 @app.on_message(filters.command("sub"))
 async def hsub_cmd(c, m: Message):
-    if not await check_command_privacy(c, m): 
+    if not await check_command_privacy(c, m):
         return
     media = m.reply_to_message.video or m.reply_to_message.document or m.reply_to_message.animation if m.reply_to_message else None
-    if not media: 
+    if not media:
         return await m.reply("❌ Hardsub ke liye kisi forwarded video/document par reply karein.")
 
     orig_name = getattr(media, "file_name", "output.mp4")
     await m.reply("📝 Subtitle file (.vtt/.srt/.ass) reply karke bhejo ya `S` type karke skip karo.")
     users_data[m.from_user.id] = {
-        "video_msg_id": m.reply_to_message.id, 
-        "chat_id": m.chat.id, 
-        "state": "WAIT_SUB", 
-        "rename": "none", 
+        "video_msg_id": m.reply_to_message.id,
+        "video_file_id": media.file_id,  # FIX: store file_id at capture time
+        "chat_id": m.chat.id,
+        "state": "WAIT_SUB",
+        "rename": "none",
         "orig_name": orig_name
     }
 
 async def prompt_watermark_or_execute(c, m, user_id, session):
-    wm_link = await get_pinned_file_link(session["chat_id"], "watermark")
+    wm_link = await get_pinned_file_id(session["chat_id"], "watermark")
     if wm_link != "none":
         session["state"] = "WAIT_WM_CHOICE"
         await m.reply("🖼️ Watermark add karna hai? Type `A` to Add ya `S` to skip.")
@@ -407,77 +417,79 @@ async def prompt_watermark_or_execute(c, m, user_id, session):
 
 @app.on_message(filters.text | filters.document)
 async def replies_controller(c, m: Message):
-    if not m.from_user or (m.text and m.text.startswith("/")): 
+    if not m.from_user or (m.text and m.text.startswith("/")):
         return
     user_id = m.from_user.id
-    if user_id not in users_data: 
+    if user_id not in users_data:
         return
     session = users_data[user_id]
-    if session["chat_id"] != m.chat.id: 
+    if session["chat_id"] != m.chat.id:
         return
-    
+
     state = session.get("state")
     text = m.text.strip().upper() if m.text else ""
-    
+
     if state == "WAIT_SUB":
         if m.document and m.document.file_name and m.document.file_name.lower().endswith(('.srt', '.ass', '.vtt', '.txt')):
-            session["sub_msg_link"] = f"https://t.me/c/{str(m.chat.id)[4:]}/{m.id}"
+            session["sub_file_id"] = m.document.file_id  # FIX: file_id, not a t.me link
             session["state"] = "WAIT_RENAME_CHOICE"
             await m.reply("✏️ Video rename karna hai? Type `R` to Rename ya `S` for Same Name.")
         elif text == "S":
-            session["sub_msg_link"] = "none"
+            session["sub_file_id"] = "none"
             session["state"] = "WAIT_RENAME_CHOICE"
             await m.reply("✏️ Video rename karna hai? Type `R` to Rename ya `S` for Same Name.")
-        else: 
+        else:
             await m.reply("❌ Invalid format! Sahi subtitle file (.srt, .ass, .vtt) bhejo ya `S` likh kar skip karo.")
         return
 
     if state == "WAIT_RENAME_CHOICE":
-        if text == "R": 
+        if text == "R":
             session["state"] = "WAIT_RENAME_VALUE"
             await m.reply("✍️ Naya file name bhejo (bina .mp4 lagaye):")
-        elif text == "S": 
+        elif text == "S":
             session["rename"] = session["orig_name"]
             await prompt_watermark_or_execute(c, m, user_id, session)
-        else: 
+        else:
             await m.reply("❌ Invalid! Type `R` to rename ya `S` to skip.")
         return
-            
+
     elif state == "WAIT_RENAME_VALUE":
-        if not m.text: 
+        if not m.text:
             return await m.reply("❌ Please send a valid text name.")
+        # Exact name preserved -- sirf path-unsafe chars (/ \) hataye jaate hain, baaki
+        # sab (jaise @, spaces, symbols) EXACTLY waise hi rehte hain jaise user ne likha.
         raw_name = m.text.strip().replace("/", "_").replace("\\", "_")
-        if raw_name.lower().endswith(".mp4"): 
+        if raw_name.lower().endswith(".mp4"):
             raw_name = raw_name[:-4]
         session["rename"] = raw_name + ".mp4"
         await prompt_watermark_or_execute(c, m, user_id, session)
         return
-        
+
     elif state == "WAIT_WM_CHOICE":
-        if text == "A": 
+        if text == "A":
             session["watermark"] = "yes"
-        elif text == "S": 
+        elif text == "S":
             session["watermark"] = "no"
-        else: 
+        else:
             return await m.reply("❌ Invalid! Type `A` to add watermark ya `S` to skip.")
         await execute_dispatch_hardsub(user_id, m)
 
 async def execute_dispatch_hardsub(user_id, msg: Message):
     data = users_data.pop(user_id)
     st = await msg.reply("⏳ **Task Registered!** Queue me insert kiya jaa raha hai...")
-    
+
     wm_link = "none"
     wm_pos = "right"
     if data.get("watermark") == "yes":
-        wm_link = await get_pinned_file_link(data["chat_id"], "watermark")
+        wm_link = await get_pinned_file_id(data["chat_id"], "watermark")
         wm_pos = wm_positions.get(data["chat_id"], "right")
 
     payload = {
-        "task_type": "hardsub", 
-        "video_id": f"https://t.me/c/{str(data['chat_id'])[4:]}/{data['video_msg_id']}",
-        "sub_id": data.get("sub_msg_link", "none"), "chat_id": str(data["chat_id"]), "user_id": str(user_id),
+        "task_type": "hardsub",
+        "video_id": data["video_file_id"],  # FIX: file_id, not a t.me link
+        "sub_id": data.get("sub_file_id", "none"), "chat_id": str(data["chat_id"]), "user_id": str(user_id),
         "resolution": "none", "wm_id": wm_link, "wm_pos": wm_pos, "rename": data.get("rename", "none"),
-        "font_link": await get_pinned_file_link(data["chat_id"], "file"), "trigger_msg_id": str(st.id)
+        "font_link": await get_pinned_file_id(data["chat_id"], "file"), "trigger_msg_id": str(st.id)
     }
     await enqueue_task(data["chat_id"], st.id, payload)
 
@@ -492,27 +504,33 @@ async def cancel_run_callback(c, q: CallbackQuery):
         for tid, details in list(running_tasks.items()):
             details["cancel"] = True
             cancelled = True
-        
+
         if cancelled:
             await q.message.edit("🛑 **Task Cancel Signal sent successfully!**")
             await q.answer("Task Aborted", show_alert=True)
-        else: 
+        else:
             await q.answer("Active status par koi task nahi mila.", show_alert=True)
-    except Exception as e: 
+    except Exception as e:
         await q.answer(f"Abort Exception: {e}", show_alert=True)
 
 @app.on_message(filters.command("kill"))
 async def kill_cmd(_, m: Message):
-    if not is_authorized(m): 
+    if not is_authorized(m):
         return
     msg = await m.reply_text("🗑️ Saare active notebooks abort aur cache clean kar raha hoon...")
-    
-    # Local memory cancel triggers
+
     for tid in list(running_tasks.keys()):
         running_tasks[tid]["cancel"] = True
-        
+
     deleted = await asyncio.to_thread(kill_all_notebooks)
     await msg.edit_text(f"✅ Saare Active processes abort ho gayi hain!\n🧹 `{len(deleted)}` Kaggle notebook(s) successfully delete kiye gaye.")
+
+@app.on_message(filters.command("clean"))
+async def clean_cmd(_, m: Message):
+    if not is_authorized(m):
+        return
+    had = users_data.pop(m.from_user.id, None)
+    await m.reply_text("🔄 **Session refreshed.** Pichla /sub flow reset ho gaya." if had else "🔄 **Already clean.** Koi pending session nahi thi.")
 
 # ── HEALTH SERVER ────────────────────────────────────────────────────
 class Health(http.server.BaseHTTPRequestHandler):
@@ -520,7 +538,7 @@ class Health(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"ok")
-    def log_message(self, *a): 
+    def log_message(self, *a):
         pass
 
 def run_health():
@@ -529,10 +547,9 @@ def run_health():
 
 # ── SYSTEM STARTUP ───────────────────────────────────────────────────
 async def main():
-    # Render requirements: Bind port immediately before long execution steps
     threading.Thread(target=run_health, daemon=True).start()
     print("📡 Web server bound to Render port successfully.")
-    
+
     ensure_kaggle_installed()
     await app.start()
     print(f"🚀 Controller Bot Connected (Prefix ID: {BOT_INSTANCE_HASH})!")
