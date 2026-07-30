@@ -298,9 +298,13 @@ def encode_with_fallback(base_cmd_gpu, base_cmd_cpu, duration, title):
 # ── MAIN DRIVER ──────────────────────────────────────────────────────
 async def main_driver():
     global status_msg_id
-    
+
+    # FIX: in_memory=True stops Pyrogram from creating a .session sqlite file on disk.
+    # Kaggle's script working dir (/kaggle/src) is read-only, which caused:
+    #   sqlite3.OperationalError: unable to open database file
+    # Bot-token sessions don't need to persist across runs, so in-memory storage is safe here.
     app = Client("worker_down", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, 
-                 workers=32, max_concurrent_transmissions=16, no_updates=True)
+                 workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
     await app.start()
 
     try: 
@@ -468,7 +472,7 @@ async def main_driver():
 
     # ---------------- UPLOADING ----------------
     app_up = Client("worker_up", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, 
-                    workers=32, max_concurrent_transmissions=16, no_updates=True)
+                    workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
     await app_up.start()
     try: 
         await app_up.get_chat(CHAT_ID)
