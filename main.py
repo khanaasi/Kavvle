@@ -143,27 +143,30 @@ async def get_pinned_file_id(chat_id, target_name):
     return "none"
 
 # ── KAGGLE API WRAPPERS ──────────────────────────────────────────────
-def kaggle_list_kernels(account):
+def kaggle_list_kernels_verbose(account):
+    """FIX: ab subprocess ka returncode/stderr check karta hai — pehle koi bhi
+    exception ya non-zero exit chupke se [] bana deta tha, isliye /kill se koi
+    error hi nahi dikhta tha, bas "0 deleted" jaisa silent result aata tha."""
     dummy_id = "".join(random.choices(string.ascii_lowercase, k=5))
     try:
         out = run_kaggle_command(account, ["kaggle", "kernels", "list", "-m", "--csv"], dummy_id, timeout=45)
+        if out.returncode != 0:
+            return [], f"Account #{account['idx']} (`{account['user']}`) list fail: `{(out.stderr or out.stdout).strip()[:200]}`"
         lines = out.stdout.strip().splitlines()
-        refs = []
-        for line in lines[1:]:
-            ref = line.split(",")[0].strip()
-            if "hs-" in ref:
-                refs.append(ref)
-        return refs
-    except Exception:
-        return []
+        refs = [line.split(",")[0].strip() for line in lines[1:] if "hs-" in line]
+        return refs, None
+    except Exception as e:
+        return [], f"Account #{account['idx']} (`{account['user']}`) exception: `{e}`"
 
-def kaggle_delete_kernel(account, ref):
+def kaggle_delete_kernel_verbose(account, ref):
     dummy_id = "".join(random.choices(string.ascii_lowercase, k=5))
     try:
-        run_kaggle_command(account, ["kaggle", "kernels", "delete", "-y", ref], dummy_id, timeout=45)
-        return True
-    except Exception:
-        return False
+        res = run_kaggle_command(account, ["kaggle", "kernels", "delete", "-y", ref], dummy_id, timeout=45)
+        if res.returncode == 0:
+            return True, None
+        return False, f"`{ref}` delete fail: `{(res.stderr or res.stdout).strip()[:150]}`"
+    except Exception as e:
+        return False, f"`{ref}` exception: `{e}`"
 
 def kaggle_kernel_status(account, ref):
     dummy_id = "".join(random.choices(string.ascii_lowercase, k=5))
@@ -173,12 +176,29 @@ def kaggle_kernel_status(account, ref):
     except Exception as e:
         return str(e)
 
-def kill_all_notebooks():
-    deleted = []
+def kill_all_notebooks_verbose():
+    deleted, errors = [], []
     for acc in KAG_ACCOUNTS:
-        for ref in kaggle_list_kernels(acc):
-            if kaggle_delete_kernel(acc, ref):
+        refs, err = kaggle_list_kernels_verbose(acc)
+        if err:
+            errors.append(err)
+            continue
+        for ref in refs:
+            ok, derr = kaggle_delete_kernel_verbose(acc, ref)
+            if ok:
                 deleted.append(ref)
+            else:
+                errors.append(derr)
+    return deleted, errors
+
+def kaggle_delete_kernel(account, ref):
+    """Backward-compatible wrapper used by account_worker (task cleanup path)."""
+    ok, _ = kaggle_delete_kernel_verbose(account, ref)
+    return ok
+
+def kill_all_notebooks():
+    """Backward-compatible wrapper (startup cleanup path)."""
+    deleted, _ = kill_all_notebooks_verbose()
     return deleted
 
 def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str, task_id):
@@ -516,14 +536,27 @@ async def cancel_run_callback(c, q: CallbackQuery):
 @app.on_message(filters.command("kill"))
 async def kill_cmd(_, m: Message):
     if not is_authorized(m):
-        return
+        # FIX: pehle yahan se silently return ho jaata tha -- agar env vars
+        # (OWNER_ID/ALLOWED_USER/GROUP_ID) mismatch ho to command "kaam nahi
+        # karti" jaisa lagta tha. Ab kam se kam wajah pata chalegi.
+        return await m.reply_text("❌ Aap is command ke liye authorized nahi hain (owner/allowed user/group check fail hua).")
+
+    if not KAG_ACCOUNTS:
+        return await m.reply_text("❌ Koi Kaggle account configured hi nahi hai.")
+
     msg = await m.reply_text("🗑️ Saare active notebooks abort aur cache clean kar raha hoon...")
 
     for tid in list(running_tasks.keys()):
         running_tasks[tid]["cancel"] = True
 
-    deleted = await asyncio.to_thread(kill_all_notebooks)
-    await msg.edit_text(f"✅ Saare Active processes abort ho gayi hain!\n🧹 `{len(deleted)}` Kaggle notebook(s) successfully delete kiye gaye.")
+    deleted, errors = await asyncio.to_thread(kill_all_notebooks_verbose)
+
+    text = f"✅ `{len(deleted)}` Kaggle notebook(s) delete kiye gaye."
+    if deleted:
+        text += "\n" + "\n".join(f"• `{d}`" for d in deleted[:15])
+    if errors:
+        text += "\n\n⚠️ **Errors mile:**\n" + "\n".join(f"• {e}" for e in errors[:6])
+    await msg.edit_text(text)
 
 @app.on_message(filters.command("clean"))
 async def clean_cmd(_, m: Message):
