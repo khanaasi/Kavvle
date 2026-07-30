@@ -1,8 +1,24 @@
-import os, re, json, base64, asyncio, subprocess, datetime, http.server, threading, psutil, shutil, sys, random, string
+import os, re, json, base64, asyncio, subprocess, datetime, threading, psutil, shutil, sys, random, string
 from pathlib import Path
+import pyrogram
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ChatType
+
+# --- FASTAPI SERVER TO PREVENT RENDER/HF SUSPENSION ---
+from fastapi import FastAPI
+import uvicorn
+
+web_app = FastAPI()
+
+@web_app.get("/")
+def read_root():
+    return {"status": "Kavvle System Manager is online", "timestamp": str(datetime.datetime.now())}
+
+def run_web_server():
+    port = int(os.environ.get("PORT", "7860"))
+    uvicorn.run(web_app, host="0.0.0.0", port=port, log_level="warning")
+# --------------------------------------------------------
 
 # ── CONFIGURATION & ENVIRONMENT ──────────────────────────────────────
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -55,6 +71,7 @@ def run_kaggle_command(account, cmd_args, task_ref_id, timeout=60):
         json.dump({"username": account["user"], "key": account["key"]}, f)
     try:
         creds_file.chmod(0o600)
+        config_dir.chmod(0o700)
     except:
         pass
 
@@ -149,6 +166,7 @@ def kaggle_list_kernels_verbose(account):
             parts = line.split(",")
             if parts:
                 ref = parts[0].strip()
+                # Targets specifically "hs-" prefix to kill orphaned runs flawlessly
                 if "hs-" in ref:
                     refs.append(ref)
         return refs, None
@@ -174,6 +192,7 @@ def kaggle_kernel_status(account, ref):
         return str(e)
 
 def kill_all_notebooks_verbose():
+    """Identical clean/purge loop style implemented based on tested Whisper bot structure"""
     deleted, errors = [], []
     for acc in KAG_ACCOUNTS:
         refs, err = kaggle_list_kernels_verbose(acc)
@@ -567,18 +586,21 @@ async def kill_cmd(_, m: Message):
     if not KAG_ACCOUNTS:
         return await m.reply_text("❌ Koi Kaggle account configured nahi hai.")
 
-    msg = await m.reply_text("🗑️ Saare active notebooks abort aur cache clean kar raha hoon...")
+    msg = await m.reply_text("🔄 **Querying active instances from all Kaggle accounts...**")
 
+    # Set internal soft cancel variables (stops API checks if running)
     for tid in list(running_tasks.keys()):
         running_tasks[tid]["cancel"] = True
 
+    # Uses precisely modeled threading deletion exactly like Whisper
     deleted, errors = await asyncio.to_thread(kill_all_notebooks_verbose)
 
-    text = f"✅ `{len(deleted)}` Kaggle notebook(s) delete kiye gaye."
+    text = f"✅ `{len(deleted)}` Kaggle notebook(s) successfully aborted & purged."
     if deleted:
-        text += "\n" + "\n".join(f"• `{d}`" for d in deleted[:15])
+        text += "\n\n**Deleted Kernels:**\n" + "\n".join(f"• `{d}`" for d in deleted[:15])
     if errors:
         text += "\n\n⚠️ **Errors:**\n" + "\n".join(f"• {e}" for e in errors[:6])
+    
     await msg.edit_text(text)
 
 @app.on_message(filters.command("clean"))
@@ -588,36 +610,50 @@ async def clean_cmd(_, m: Message):
     had = users_data.pop(m.from_user.id, None)
     await m.reply_text("🔄 **Session refreshed.** Pichla /sub flow reset ho gaya." if had else "🔄 **Already clean.**")
 
-# ── HEALTH SERVER ────────────────────────────────────────────────────
-class Health(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
-    def log_message(self, *a):
-        pass
-
-def run_health():
-    port = int(os.environ.get("PORT", "8080"))
-    http.server.HTTPServer(("0.0.0.0", port), Health).serve_forever()
-
-# ── SYSTEM STARTUP ───────────────────────────────────────────────────
-async def main():
-    threading.Thread(target=run_health, daemon=True).start()
-    print("📡 Web server bound successfully.")
-
-    ensure_kaggle_installed()
-    await app.start()
-    print(f"🚀 Controller Bot Connected (Prefix ID: {BOT_INSTANCE_HASH})!")
-
-    deleted = await asyncio.to_thread(kill_all_notebooks)
-    print(f"[startup] {len(deleted)} active kernels successfully aborted.")
-
-    workers = [asyncio.create_task(account_worker(acc)) for acc in KAG_ACCOUNTS]
-    print(f"[startup] {len(KAG_ACCOUNTS)} Account workers successfully initiated.")
-
-    await idle()
-    await app.stop()
-
+# ── SYSTEM STARTUP WITH FLOODWAIT HANDLER ────────────────────────────
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
+    from pyrogram.errors import FloodWait
+
+    async def run_bot_safe():
+        try:
+            threading.Thread(target=run_web_server, daemon=True).start()
+            print("📡 Web server bound successfully.")
+
+            ensure_kaggle_installed()
+            await app.start()
+            print(f"🚀 Controller Bot Connected (Prefix ID: {BOT_INSTANCE_HASH})!")
+
+            deleted = await asyncio.to_thread(kill_all_notebooks)
+            print(f"[startup] {len(deleted)} active kernels successfully aborted.")
+
+            for acc in KAG_ACCOUNTS:
+                asyncio.create_task(account_worker(acc))
+            print(f"[startup] {len(KAG_ACCOUNTS)} Account workers successfully initiated.")
+
+            await pyrogram.idle()
+            await app.stop()
+
+        except FloodWait as e:
+            print(f"⚠️ Telegram FloodWait triggered! Sleeping for {e.value} seconds to clear rate limit.")
+            await asyncio.sleep(e.value + 10)
+            try:
+                print("🔄 Attempting startup after waiting out the rate limit...")
+                await app.start()
+                print("✅ Bot successfully started after recovery!")
+                for acc in KAG_ACCOUNTS:
+                    asyncio.create_task(account_worker(acc))
+                await pyrogram.idle()
+            except Exception as retry_err:
+                print(f"❌ Failed to start bot after recovery attempt: {retry_err}")
+                sys.exit(1)
+        except Exception as startup_err:
+            print(f"❌ Critical error on startup: {startup_err}")
+            sys.exit(1)
+
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(run_bot_safe())
+    except (KeyboardInterrupt, SystemExit):
+        print("🔌 Bot execution terminated cleanly.")
+    except Exception as e:
+        print(f"🚨 Fatal exception in main execution loop: {e}")
