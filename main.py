@@ -29,7 +29,7 @@ def load_kaggle_accounts():
         accs.append({"idx": i, "user": u, "key": k})
         i += 1
     if not accs:
-        raise RuntimeError("Koi bhi KAG_USER1/KAG_KEY1 environment variable set nahi hai.")
+        raise RuntimeError("No Kaggle credentials configured in environment variables.")
     return accs
 
 KAG_ACCOUNTS = load_kaggle_accounts()
@@ -105,7 +105,7 @@ async def check_command_privacy(c, m: Message):
     return is_authorized(m)
 
 async def get_pinned_file_link(chat_id, target_name):
-    """Pinned registry text se link nikalta hai (backward compatible helper)."""
+    """Retrieves pinned file links from registries."""
     try:
         chat = await app.get_chat(chat_id)
         if chat.pinned_message and chat.pinned_message.text and f"Name – {target_name}" in chat.pinned_message.text:
@@ -121,39 +121,36 @@ async def get_pinned_file_link(chat_id, target_name):
         pass
     return "none"
 
-# ── FIX: FILE_ID RESOLVER ─────────────────────────────────────────────
-# Root cause of "Telegram video download failed": Kaggle ka worker session
-# har run par bilkul FRESH hota hai, usne kabhi GROUP_ID ko dekha nahi hota,
-# isliye wahan se seedha get_messages(chat_id, msg_id) call karna peer
-# resolution error deta hai. Fix: main.py ka apna LIVE session (jo already
-# us group me active hai) file_id nikaal ke Kaggle ko bhejta hai — file_id
-# se download karne ke liye kisi peer/chat resolution ki zarurat nahi padti.
-async def get_pinned_file_id(chat_id, target_name):
+async def copy_pinned_file_to_desk(chat_id, target_name):
+    """Resolves and mirrors pinned registry content to safe log channel for secure access."""
     link = await get_pinned_file_link(chat_id, target_name)
     if link == "none":
         return "none"
     try:
         msg_id = int(link.rstrip("/").split("/")[-1])
         msg = await app.get_messages(chat_id, msg_id)
-        media = msg.document or msg.video or msg.photo or msg.animation if msg else None
-        if media:
-            return media.file_id
+        if msg:
+            copied = await msg.copy(DESK_CHANNEL_ID)
+            return str(copied.id)
     except Exception as e:
-        print(f"[get_pinned_file_id] resolve fail: {e}")
+        print(f"[copy_pinned_file_to_desk] Failed to duplicate asset: {e}")
     return "none"
 
 # ── KAGGLE API WRAPPERS ──────────────────────────────────────────────
 def kaggle_list_kernels_verbose(account):
-    """FIX: ab subprocess ka returncode/stderr check karta hai — pehle koi bhi
-    exception ya non-zero exit chupke se [] bana deta tha, isliye /kill se koi
-    error hi nahi dikhta tha, bas "0 deleted" jaisa silent result aata tha."""
     dummy_id = "".join(random.choices(string.ascii_lowercase, k=5))
     try:
-        out = run_kaggle_command(account, ["kaggle", "kernels", "list", "-m", "--csv"], dummy_id, timeout=45)
+        out = run_kaggle_command(account, ["kaggle", "kernels", "list", "--user", account["user"], "--csv"], dummy_id, timeout=45)
         if out.returncode != 0:
             return [], f"Account #{account['idx']} (`{account['user']}`) list fail: `{(out.stderr or out.stdout).strip()[:200]}`"
         lines = out.stdout.strip().splitlines()
-        refs = [line.split(",")[0].strip() for line in lines[1:] if "hs-" in line]
+        refs = []
+        for line in lines[1:]:
+            parts = line.split(",")
+            if parts:
+                ref = parts[0].strip()
+                if "hs-" in ref:
+                    refs.append(ref)
         return refs, None
     except Exception as e:
         return [], f"Account #{account['idx']} (`{account['user']}`) exception: `{e}`"
@@ -161,7 +158,7 @@ def kaggle_list_kernels_verbose(account):
 def kaggle_delete_kernel_verbose(account, ref):
     dummy_id = "".join(random.choices(string.ascii_lowercase, k=5))
     try:
-        res = run_kaggle_command(account, ["kaggle", "kernels", "delete", "-y", ref], dummy_id, timeout=45)
+        res = run_kaggle_command(account, ["kaggle", "kernels", "delete", "-k", ref], dummy_id, timeout=45)
         if res.returncode == 0:
             return True, None
         return False, f"`{ref}` delete fail: `{(res.stderr or res.stdout).strip()[:150]}`"
@@ -192,12 +189,10 @@ def kill_all_notebooks_verbose():
     return deleted, errors
 
 def kaggle_delete_kernel(account, ref):
-    """Backward-compatible wrapper used by account_worker (task cleanup path)."""
     ok, _ = kaggle_delete_kernel_verbose(account, ref)
     return ok
 
 def kill_all_notebooks():
-    """Backward-compatible wrapper (startup cleanup path)."""
     deleted, _ = kill_all_notebooks_verbose()
     return deleted
 
@@ -394,15 +389,27 @@ async def compress_cmd(c, m: Message):
     cmd = RES_CMD_MAP[m.command[0].lower()]
     orig_name = getattr(media, "file_name", "output.mp4")
 
-    st = await m.reply("⏳ **Task Registered!** Queue me insert kiya jaa raha hai...")
-    font_link = await get_pinned_file_id(m.chat.id, "file")
+    st = await m.reply("⏳ **Task Registered!** Copying file to secure channel...")
+    
+    try:
+        copied_video = await m.reply_to_message.copy(DESK_CHANNEL_ID)
+    except Exception as e:
+        return await st.edit(f"❌ Secure Channel Copy Error: `{e}`")
+
+    font_msg_id = await copy_pinned_file_to_desk(m.chat.id, "file")
 
     payload = {
         "task_type": "compress",
-        "video_id": media.file_id,  # FIX: file_id, not a t.me link
-        "sub_id": "none", "chat_id": str(m.chat.id), "user_id": str(m.from_user.id),
-        "resolution": cmd, "wm_id": "none", "wm_pos": "none", "rename": orig_name,
-        "font_link": font_link, "trigger_msg_id": str(st.id)
+        "video_msg_id": str(copied_video.id),
+        "sub_msg_id": "none", 
+        "chat_id": str(m.chat.id), 
+        "user_id": str(m.from_user.id),
+        "resolution": cmd, 
+        "wm_msg_id": "none", 
+        "wm_pos": "none", 
+        "rename": orig_name,
+        "font_msg_id": font_msg_id, 
+        "trigger_msg_id": str(st.id)
     }
     await enqueue_task(m.chat.id, st.id, payload)
 
@@ -416,10 +423,16 @@ async def hsub_cmd(c, m: Message):
         return await m.reply("❌ Hardsub ke liye kisi forwarded video/document par reply karein.")
 
     orig_name = getattr(media, "file_name", "output.mp4")
+    st_copy = await m.reply("⏳ **Securing Video File...**")
+    try:
+        copied_video = await m.reply_to_message.copy(DESK_CHANNEL_ID)
+        await st_copy.delete()
+    except Exception as e:
+        return await st_copy.edit(f"❌ Secure Channel Copy Error: `{e}`")
+
     await m.reply("📝 Subtitle file (.vtt/.srt/.ass) reply karke bhejo ya `S` type karke skip karo.")
     users_data[m.from_user.id] = {
-        "video_msg_id": m.reply_to_message.id,
-        "video_file_id": media.file_id,  # FIX: store file_id at capture time
+        "video_msg_id": str(copied_video.id),
         "chat_id": m.chat.id,
         "state": "WAIT_SUB",
         "rename": "none",
@@ -427,7 +440,7 @@ async def hsub_cmd(c, m: Message):
     }
 
 async def prompt_watermark_or_execute(c, m, user_id, session):
-    wm_link = await get_pinned_file_id(session["chat_id"], "watermark")
+    wm_link = await get_pinned_file_link(session["chat_id"], "watermark")
     if wm_link != "none":
         session["state"] = "WAIT_WM_CHOICE"
         await m.reply("🖼️ Watermark add karna hai? Type `A` to Add ya `S` to skip.")
@@ -451,11 +464,18 @@ async def replies_controller(c, m: Message):
 
     if state == "WAIT_SUB":
         if m.document and m.document.file_name and m.document.file_name.lower().endswith(('.srt', '.ass', '.vtt', '.txt')):
-            session["sub_file_id"] = m.document.file_id  # FIX: file_id, not a t.me link
+            st_sub = await m.reply("⏳ **Securing Subtitle File...**")
+            try:
+                copied_sub = await m.copy(DESK_CHANNEL_ID)
+                session["sub_msg_id"] = str(copied_sub.id)
+                await st_sub.delete()
+            except Exception as e:
+                return await st_sub.edit(f"❌ Subtitle Copy Error: `{e}`")
+                
             session["state"] = "WAIT_RENAME_CHOICE"
             await m.reply("✏️ Video rename karna hai? Type `R` to Rename ya `S` for Same Name.")
         elif text == "S":
-            session["sub_file_id"] = "none"
+            session["sub_msg_id"] = "none"
             session["state"] = "WAIT_RENAME_CHOICE"
             await m.reply("✏️ Video rename karna hai? Type `R` to Rename ya `S` for Same Name.")
         else:
@@ -476,8 +496,6 @@ async def replies_controller(c, m: Message):
     elif state == "WAIT_RENAME_VALUE":
         if not m.text:
             return await m.reply("❌ Please send a valid text name.")
-        # Exact name preserved -- sirf path-unsafe chars (/ \) hataye jaate hain, baaki
-        # sab (jaise @, spaces, symbols) EXACTLY waise hi rehte hain jaise user ne likha.
         raw_name = m.text.strip().replace("/", "_").replace("\\", "_")
         if raw_name.lower().endswith(".mp4"):
             raw_name = raw_name[:-4]
@@ -498,18 +516,26 @@ async def execute_dispatch_hardsub(user_id, msg: Message):
     data = users_data.pop(user_id)
     st = await msg.reply("⏳ **Task Registered!** Queue me insert kiya jaa raha hai...")
 
-    wm_link = "none"
+    wm_msg_id = "none"
     wm_pos = "right"
     if data.get("watermark") == "yes":
-        wm_link = await get_pinned_file_id(data["chat_id"], "watermark")
+        wm_msg_id = await copy_pinned_file_to_desk(data["chat_id"], "watermark")
         wm_pos = wm_positions.get(data["chat_id"], "right")
+
+    font_msg_id = await copy_pinned_file_to_desk(data["chat_id"], "file")
 
     payload = {
         "task_type": "hardsub",
-        "video_id": data["video_file_id"],  # FIX: file_id, not a t.me link
-        "sub_id": data.get("sub_file_id", "none"), "chat_id": str(data["chat_id"]), "user_id": str(user_id),
-        "resolution": "none", "wm_id": wm_link, "wm_pos": wm_pos, "rename": data.get("rename", "none"),
-        "font_link": await get_pinned_file_id(data["chat_id"], "file"), "trigger_msg_id": str(st.id)
+        "video_msg_id": data["video_msg_id"],
+        "sub_msg_id": data.get("sub_msg_id", "none"), 
+        "chat_id": str(data["chat_id"]), 
+        "user_id": str(user_id),
+        "resolution": "none", 
+        "wm_msg_id": wm_msg_id, 
+        "wm_pos": wm_pos, 
+        "rename": data.get("rename", "none"),
+        "font_msg_id": font_msg_id, 
+        "trigger_msg_id": str(st.id)
     }
     await enqueue_task(data["chat_id"], st.id, payload)
 
@@ -536,13 +562,10 @@ async def cancel_run_callback(c, q: CallbackQuery):
 @app.on_message(filters.command("kill"))
 async def kill_cmd(_, m: Message):
     if not is_authorized(m):
-        # FIX: pehle yahan se silently return ho jaata tha -- agar env vars
-        # (OWNER_ID/ALLOWED_USER/GROUP_ID) mismatch ho to command "kaam nahi
-        # karti" jaisa lagta tha. Ab kam se kam wajah pata chalegi.
-        return await m.reply_text("❌ Aap is command ke liye authorized nahi hain (owner/allowed user/group check fail hua).")
+        return await m.reply_text("❌ Aap is command ke liye authorized nahi hain.")
 
     if not KAG_ACCOUNTS:
-        return await m.reply_text("❌ Koi Kaggle account configured hi nahi hai.")
+        return await m.reply_text("❌ Koi Kaggle account configured nahi hai.")
 
     msg = await m.reply_text("🗑️ Saare active notebooks abort aur cache clean kar raha hoon...")
 
@@ -555,7 +578,7 @@ async def kill_cmd(_, m: Message):
     if deleted:
         text += "\n" + "\n".join(f"• `{d}`" for d in deleted[:15])
     if errors:
-        text += "\n\n⚠️ **Errors mile:**\n" + "\n".join(f"• {e}" for e in errors[:6])
+        text += "\n\n⚠️ **Errors:**\n" + "\n".join(f"• {e}" for e in errors[:6])
     await msg.edit_text(text)
 
 @app.on_message(filters.command("clean"))
@@ -563,7 +586,7 @@ async def clean_cmd(_, m: Message):
     if not is_authorized(m):
         return
     had = users_data.pop(m.from_user.id, None)
-    await m.reply_text("🔄 **Session refreshed.** Pichla /sub flow reset ho gaya." if had else "🔄 **Already clean.** Koi pending session nahi thi.")
+    await m.reply_text("🔄 **Session refreshed.** Pichla /sub flow reset ho gaya." if had else "🔄 **Already clean.**")
 
 # ── HEALTH SERVER ────────────────────────────────────────────────────
 class Health(http.server.BaseHTTPRequestHandler):
@@ -581,7 +604,7 @@ def run_health():
 # ── SYSTEM STARTUP ───────────────────────────────────────────────────
 async def main():
     threading.Thread(target=run_health, daemon=True).start()
-    print("📡 Web server bound to Render port successfully.")
+    print("📡 Web server bound successfully.")
 
     ensure_kaggle_installed()
     await app.start()
