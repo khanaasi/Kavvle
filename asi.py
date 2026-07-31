@@ -1,6 +1,5 @@
 import os, sys, site, importlib, importlib.util, importlib.metadata, traceback
 import time, asyncio, subprocess, json, gc, re, base64, requests, html, shutil, threading
-from urllib.parse import quote
 
 # ----------------------------- EARLY PATH SETUP -----------------------------
 def _ensure_user_site_path():
@@ -20,7 +19,6 @@ last_time = 0
 start_time = 0
 status_msg_id = None
 app = None
-event_loop = None  # will store the running asyncio loop for thread-safe edits
 
 CONFIG_B64 = ""
 
@@ -120,19 +118,33 @@ def get_send_bar(percent):
     filled = int(percent / 100 * 20)
     return f"[{'▓' * filled}{'▒' * (20 - filled)}]"
 
-async def _pyro_edit_status(text):
-    """Edit status message using Pyrogram (fast, no HTTP overhead)."""
-    if app and status_msg_id:
+async def prog(current, total, step_name):
+    """Pyrogram progress callback – fast, uses Pyrogram edit."""
+    global last_time, start_time, app
+    now = time.time()
+    if start_time == 0:
+        start_time = now; last_time = now; return
+    if now - last_time > 12 or current >= total:
+        elapsed = now - start_time
+        speed = current / elapsed if elapsed > 0 else 0
+        speed_mb = (speed / 1024) / 1024
+        percent = (current / total) * 100 if total > 0 else 0
+        if "download" in step_name:
+            text = f"📥 **Downloading Video**\n{get_download_bar(percent)} [{percent:.1f}%]\n🚀 Speed: **{speed_mb:.2f} MB/s**\n📦 {current/1048576:.1f}MB / {total/1048576:.1f}MB"
+        else:
+            text = f"📤 **Sending Video**\n{get_send_bar(percent)} [{percent:.1f}%]\n🚀 Speed: **{speed_mb:.2f} MB/s**\n📦 {current/1048576:.1f}MB / {total/1048576:.1f}MB"
         try:
-            await app.edit_message_text(
-                CHAT_ID, status_msg_id, text,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data="cancel_active_run")]])
-            )
+            if app and status_msg_id:
+                await app.edit_message_text(
+                    CHAT_ID, status_msg_id, text,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data="cancel_active_run")]])
+                )
         except:
             pass
+        last_time = now
 
 def _sync_http_edit(text):
-    """Fallback HTTP edit (used during encoding when Pyrogram is down)."""
+    """Fallback HTTP edit for encoding progress."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     payload = {
         "chat_id": CHAT_ID, "message_id": status_msg_id, "text": text, "parse_mode": "HTML",
@@ -144,51 +156,10 @@ def _sync_http_edit(text):
         pass
 
 def fire_and_forget_http(text):
-    """Non‑blocking HTTP status update (for encoding)."""
+    """Non‑blocking HTTP update (used during encoding)."""
     threading.Thread(target=_sync_http_edit, args=(text,), daemon=True).start()
 
-# ----------------------------- DIRECT HTTP DOWNLOAD -----------------------------
-def download_via_file_id_http(file_id, output_path, step_name):
-    """Download a Telegram file by file_id using direct HTTP streaming.
-       This is typically faster than Pyrogram's MTProto download on Kaggle."""
-    # Get file path from Bot API
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
-    resp = requests.post(url, json={"file_id": file_id}, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("ok"):
-        raise Exception(f"getFile failed: {data}")
-    file_path = data["result"]["file_path"]
-    download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{quote(file_path)}"
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with requests.get(download_url, stream=True, timeout=300) as r:
-        r.raise_for_status()
-        total = int(r.headers.get('content-length', 0))
-        downloaded = 0
-        start = time.time()
-        last_update = 0
-        with open(output_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8*1024*1024):  # 8 MB chunks
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    now = time.time()
-                    if now - last_update > 10 or downloaded >= total:
-                        # Calculate progress
-                        elapsed = now - start
-                        speed = downloaded / elapsed if elapsed > 0 else 0
-                        speed_mb = (speed / 1024) / 1024
-                        percent = (downloaded / total) * 100 if total > 0 else 0
-                        bar = get_download_bar(percent)
-                        text = f"📥 **Downloading Video**\n{bar} [{percent:.1f}%]\n🚀 Speed: **{speed_mb:.2f} MB/s**\n📦 {downloaded/1048576:.1f}MB / {total/1048576:.1f}MB"
-                        # Schedule Pyrogram edit in the event loop
-                        if event_loop and event_loop.is_running():
-                            asyncio.run_coroutine_threadsafe(_pyro_edit_status(text), event_loop)
-                        last_update = now
-    return output_path
-
-# ----------------------------- DOWNLOAD WRAPPERS -----------------------------
+# ----------------------------- DOWNLOAD FUNCTIONS (Pyrogram only) -----------------------------
 async def download_message_asset(app_instance, msg_id_str, output_path, step_name):
     if not msg_id_str or msg_id_str == "none":
         return None
@@ -200,8 +171,14 @@ async def download_message_asset(app_instance, msg_id_str, output_path, step_nam
         media = msg.document or msg.video or msg.audio or msg.photo or msg.animation
         if not media:
             raise Exception("No valid downloadable stream in secured message.")
-        file_id = media.file_id
-        return await asyncio.to_thread(download_via_file_id_http, file_id, output_path, step_name)
+        reset_prog()
+        result = await asyncio.wait_for(
+            app_instance.download_media(msg, file_name=output_path, progress=prog, progress_args=(step_name,)),
+            timeout=1800
+        )
+        if not result or not os.path.exists(result):
+            raise Exception("Mirrored file failed to write successfully.")
+        return result
     except Exception as e:
         raise Exception(f"Download Error on secured step '{step_name}': {type(e).__name__}: {e}")
 
@@ -209,7 +186,14 @@ async def download_by_file_id(app_instance, file_id, output_path, step_name):
     if not file_id or file_id == "none":
         return None
     try:
-        return await asyncio.to_thread(download_via_file_id_http, file_id, output_path, step_name)
+        reset_prog()
+        result = await asyncio.wait_for(
+            app_instance.download_media(file_id, file_name=output_path, progress=prog, progress_args=(step_name,)),
+            timeout=1800
+        )
+        if not result or not os.path.exists(result):
+            raise Exception("File path failed to register on fallback.")
+        return result
     except Exception as e:
         raise Exception(f"Fallback download failed on '{step_name}': {type(e).__name__}: {e}")
 
@@ -260,7 +244,7 @@ def encode_with_fallback(base_cmd_gpu, base_cmd_cpu, duration, title):
 async def deliver_video_asset(app_instance, chat_id, target_user, file_path, caption):
     if not os.path.exists(file_path) or os.path.getsize(file_path) < 100:
         raise Exception("Processed output file was empty or missing.")
-    thumb_path = "thumb.jpg"
+    thumb_path = os.path.join(WORK_DIR, "thumb.jpg")
     try:
         subprocess.run(["ffmpeg", "-y", "-i", file_path, "-ss", "00:00:01", "-vframes", "1", thumb_path],
                        capture_output=True, timeout=15)
@@ -269,31 +253,12 @@ async def deliver_video_asset(app_instance, chat_id, target_user, file_path, cap
     if not os.path.exists(thumb_path):
         thumb_path = None
 
-    # We'll use Pyrogram's send_document with progress, but Pyrogram's upload might be slower.
-    # However, upload speed is usually limited by Telegram's receiving speed, not our code.
-    # We'll keep Pyrogram for now.
-    # (You can later switch to HTTP upload if needed, but it's more complex with large files)
     reset_prog()
-    # A simple progress wrapper using Pyrogram's own progress
-    async def pyro_prog(current, total):
-        global last_time, start_time
-        now = time.time()
-        if start_time == 0:
-            start_time = now; last_time = now; return
-        if now - last_time > 12 or current >= total:
-            elapsed = now - start_time
-            speed = current / elapsed if elapsed > 0 else 0
-            speed_mb = (speed / 1024) / 1024
-            percent = (current / total) * 100 if total > 0 else 0
-            text = f"📤 **Sending Video**\n{get_send_bar(percent)} [{percent:.1f}%]\n🚀 Speed: **{speed_mb:.2f} MB/s**\n📦 {current/1048576:.1f}MB / {total/1048576:.1f}MB"
-            await _pyro_edit_status(text)
-            last_time = now
-
     pm_msg, file_id = None, None
     try:
         pm_msg = await asyncio.wait_for(
             app_instance.send_document(chat_id=target_user, document=file_path, caption=caption,
-                                       thumb=thumb_path, progress=pyro_prog),
+                                       thumb=thumb_path, progress=prog, progress_args=("sending_video",)),
             timeout=1800
         )
         if pm_msg and pm_msg.document:
@@ -303,7 +268,7 @@ async def deliver_video_asset(app_instance, chat_id, target_user, file_path, cap
             pm_msg = await asyncio.wait_for(
                 app_instance.send_document(chat_id=chat_id, document=file_path,
                                            caption=f"⚠️ <a href='tg://user?id={target_user}'>User</a>, Video Ready:\n\n{caption}",
-                                           thumb=thumb_path, progress=pyro_prog,
+                                           thumb=thumb_path, progress=prog, progress_args=("sending_video",),
                                            parse_mode=ParseMode.HTML),
                 timeout=1800
             )
@@ -322,10 +287,8 @@ async def deliver_video_asset(app_instance, chat_id, target_user, file_path, cap
 
 # ----------------------------- MAIN DRIVER -----------------------------
 async def main_driver():
-    global status_msg_id, app, event_loop
-    event_loop = asyncio.get_running_loop()
+    global status_msg_id, app
 
-    # Initial Pyrogram client for downloads (will be used for getting messages and later for upload)
     app = Client("worker_down", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
                  workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
     await app.start()
@@ -408,8 +371,6 @@ async def main_driver():
         if WM_MSG_ID and WM_MSG_ID != "none" and not has_watermark:
             wm_file = await download_asset_robust(app, WM_MSG_ID, os.path.join(WORK_DIR, "watermark.png"), "hardsub_download")
 
-    # We keep the Pyrogram client alive during encoding? No, we'll stop it to free memory, but we'll need it later for upload.
-    # Since we are not using Pyrogram for encoding progress (we use HTTP), we can safely stop it now.
     await app.stop()
 
     process_title = "Compressing" if TASK_TYPE == "compress" else "Encoding Hardsub"
@@ -486,7 +447,7 @@ async def main_driver():
 
         await asyncio.to_thread(encode_with_fallback, cmd_gpu, cmd_cpu, duration, process_title)
 
-    # --- RESTART PYROGRAM FOR UPLOAD ---
+    # --- UPLOAD ---
     app = Client("worker_up", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
                  workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
     await app.start()
