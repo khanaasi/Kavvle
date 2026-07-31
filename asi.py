@@ -66,6 +66,7 @@ try:
     FONT_MSG_ID = CFG.get("font_msg_id", "none")
     DESK_CHANNEL_ID = -1003700822969
     HW_MODE = CFG.get("hardware_mode", "cpu")
+    SESSION_STRING = CFG.get("session_string", None)  # New: session string for no-authorization login
 except Exception:
     tb = traceback.format_exc()
     report_critical_failure(tb)
@@ -198,17 +199,15 @@ async def kill_all_other_notebooks():
     """Kill all active Kaggle notebooks for the current account except this one."""
     username = os.environ.get("KAGGLE_USERNAME", "").strip()
     api_key = os.environ.get("KAGGLE_KEY", "").strip()
-    current_kernel = os.environ.get("KAGGLE_KERNEL_NAME", "").strip()  # e.g., "username/notebook-name"
+    current_kernel = os.environ.get("KAGGLE_KERNEL_NAME", "").strip()
 
     if not username or not api_key:
         print("⚠️ Kaggle credentials not found. Skipping notebook cleanup.")
         return
 
-    # Ensure kaggle CLI uses the correct credentials
     os.environ["KAGGLE_USERNAME"] = username
     os.environ["KAGGLE_KEY"] = api_key
 
-    # List all kernels for this user
     proc = await asyncio.create_subprocess_exec(
         "kaggle", "kernels", "list", "--user", username, "--csv",
         stdout=asyncio.subprocess.PIPE,
@@ -222,15 +221,13 @@ async def kill_all_other_notebooks():
 
     lines = stdout.decode().strip().split("\n")
     killed = []
-    for line in lines[1:]:  # skip header
+    for line in lines[1:]:
         parts = line.split(",")
         if not parts:
             continue
         ref = parts[0].strip()
-        # Skip the current kernel so we don't kill ourselves
         if current_kernel and ref == current_kernel:
             continue
-        # Delete the kernel
         del_proc = await asyncio.create_subprocess_exec(
             "kaggle", "kernels", "delete", "-k", ref,
             stdout=asyncio.subprocess.PIPE,
@@ -374,8 +371,14 @@ async def deliver_video_asset(app_instance, chat_id, target_user, file_path, cap
 async def main_driver():
     global status_msg_id, app
 
-    app = Client("worker_down", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-                 workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
+    # --- FIRST SESSION (DOWNLOAD) USING SESSION STRING ---
+    if SESSION_STRING:
+        app = Client("worker_down", api_id=API_ID, api_hash=API_HASH,
+                     session_string=SESSION_STRING,
+                     workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
+    else:
+        app = Client("worker_down", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
+                     workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
     await app.start()
     try:
         await app.get_chat(CHAT_ID)
@@ -387,7 +390,7 @@ async def main_driver():
         init_msg = await app.send_message(CHAT_ID, "⚙️ Worker running...")
         status_msg_id = init_msg.id
 
-    # 🆕 Step 0: Kill all other notebooks to free resources
+    # Kill other notebooks (except self)
     await kill_all_other_notebooks()
 
     step_dl = "hardsub_download" if TASK_TYPE == "hardsub" else "compress_download"
@@ -495,7 +498,7 @@ async def main_driver():
 
         await update_http_status(f"⚙️ {process_title}\n{get_process_bar(0)} [0.0%]")
 
-        # CRF 34 for compression (FIX 1)
+        # CRF 34 compression
         cmd_cpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", scale_filter,
                    "-map", "0:v", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
                    "-crf", "34", "-pix_fmt", "yuv420p", "-threads", "0", "-c:a", "aac", "-b:a", "128k",
@@ -536,9 +539,14 @@ async def main_driver():
 
         await asyncio.to_thread(encode_with_fallback, cmd_gpu, cmd_cpu, duration, process_title)
 
-    # --- UPLOAD ---
-    app = Client("worker_up", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-                 workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
+    # --- SECOND SESSION (UPLOAD) USING SESSION STRING ---
+    if SESSION_STRING:
+        app = Client("worker_up", api_id=API_ID, api_hash=API_HASH,
+                     session_string=SESSION_STRING,
+                     workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
+    else:
+        app = Client("worker_up", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
+                     workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
     await app.start()
     try:
         await app.get_chat(CHAT_ID)
