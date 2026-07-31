@@ -71,7 +71,7 @@ except Exception:
     report_critical_failure(tb)
     sys.exit(1)
 
-# ----------------------------- DEPENDENCY SYSTEM -----------------------------
+# ----------------------------- DEPENDENCY SYSTEM (with path fix) -----------------------------
 def ensure_deps():
     need = []
     for mod, pip_name in [("pyrogram", "pyrogram"), ("tgcrypto", "tgcrypto"),
@@ -83,7 +83,7 @@ def ensure_deps():
         cmd = [sys.executable, "-m", "pip", "install", "-q", "--user", "--no-cache-dir", *need]
         try:
             subprocess.run(cmd, check=True)
-        except:
+        except Exception:
             subprocess.run(cmd, check=False)
         _ensure_user_site_path()
         importlib.invalidate_caches()
@@ -119,7 +119,6 @@ def get_send_bar(percent):
     return f"[{'▓' * filled}{'▒' * (20 - filled)}]"
 
 async def prog(current, total, step_name):
-    """Pyrogram progress callback – fast, uses Pyrogram edit."""
     global last_time, start_time, app
     now = time.time()
     if start_time == 0:
@@ -135,31 +134,117 @@ async def prog(current, total, step_name):
             text = f"📤 **Sending Video**\n{get_send_bar(percent)} [{percent:.1f}%]\n🚀 Speed: **{speed_mb:.2f} MB/s**\n📦 {current/1048576:.1f}MB / {total/1048576:.1f}MB"
         try:
             if app and status_msg_id:
-                await app.edit_message_text(
-                    CHAT_ID, status_msg_id, text,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data="cancel_active_run")]])
-                )
+                await app.edit_message_text(CHAT_ID, status_msg_id, text,
+                                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data="cancel_active_run")]]))
         except:
             pass
         last_time = now
 
 def _sync_http_edit(text):
-    """Fallback HTTP edit for encoding progress."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
-    payload = {
-        "chat_id": CHAT_ID, "message_id": status_msg_id, "text": text, "parse_mode": "HTML",
-        "reply_markup": {"inline_keyboard": [[{"text": "🛑 Cancel Task", "callback_data": "cancel_active_run"}]]}
-    }
+    payload = {"chat_id": CHAT_ID, "message_id": status_msg_id, "text": text, "parse_mode": "HTML",
+               "reply_markup": {"inline_keyboard": [[{"text": "🛑 Cancel Task", "callback_data": "cancel_active_run"}]]}}
     try:
         requests.post(url, json=payload, timeout=5)
     except:
         pass
 
 def fire_and_forget_http(text):
-    """Non‑blocking HTTP update (used during encoding)."""
     threading.Thread(target=_sync_http_edit, args=(text,), daemon=True).start()
 
-# ----------------------------- DOWNLOAD FUNCTIONS (Pyrogram only) -----------------------------
+# ----------------------------- UTILITY FUNCTIONS -----------------------------
+def get_duration(video_path):
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+                            capture_output=True, text=True, timeout=10)
+        return float(r.stdout.strip()) if r.stdout.strip() else 0.0
+    except:
+        return 0
+
+def get_font_name(font_path):
+    try:
+        font = TTFont(font_path)
+        for record in font['name'].names:
+            if record.nameID == 4:
+                return record.toUnicode()
+    except:
+        pass
+    return "Arial"
+
+def is_ass_format(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            head = f.read(4000)
+        return bool(re.search(r'\[Script Info\]|\[V4\+?\s*Styles\]|\[Events\]', head, re.IGNORECASE))
+    except:
+        return False
+
+def convert_to_clean_ass(input_sub, output_ass):
+    try:
+        subs = pysubs2.load(input_sub)
+        subs.styles["Default"] = pysubs2.SSAStyle(fontname="Arial", fontsize=24,
+            primarycolor=pysubs2.Color(255, 255, 255), outlinecolor=pysubs2.Color(0, 0, 0),
+            outline=2, shadow=1, marginl=20, marginr=20, marginv=15)
+        for line in subs:
+            line.style = "Default"
+            line.text = re.sub(r'<[^>]+>', '', re.sub(r'\{[^}]+\}', '', line.text)).replace('\r', '').replace('\n', '\\N').strip()
+        subs.save(output_ass)
+    except:
+        pass
+
+# ----------------------------- KAGGLE NOTEBOOK CLEANUP -----------------------------
+async def kill_all_other_notebooks():
+    """Kill all active Kaggle notebooks for the current account except this one."""
+    username = os.environ.get("KAGGLE_USERNAME", "").strip()
+    api_key = os.environ.get("KAGGLE_KEY", "").strip()
+    current_kernel = os.environ.get("KAGGLE_KERNEL_NAME", "").strip()  # e.g., "username/notebook-name"
+
+    if not username or not api_key:
+        print("⚠️ Kaggle credentials not found. Skipping notebook cleanup.")
+        return
+
+    # Ensure kaggle CLI uses the correct credentials
+    os.environ["KAGGLE_USERNAME"] = username
+    os.environ["KAGGLE_KEY"] = api_key
+
+    # List all kernels for this user
+    proc = await asyncio.create_subprocess_exec(
+        "kaggle", "kernels", "list", "--user", username, "--csv",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        print(f"⚠️ Failed to list kernels: {stderr.decode()}")
+        return
+
+    lines = stdout.decode().strip().split("\n")
+    killed = []
+    for line in lines[1:]:  # skip header
+        parts = line.split(",")
+        if not parts:
+            continue
+        ref = parts[0].strip()
+        # Skip the current kernel so we don't kill ourselves
+        if current_kernel and ref == current_kernel:
+            continue
+        # Delete the kernel
+        del_proc = await asyncio.create_subprocess_exec(
+            "kaggle", "kernels", "delete", "-k", ref,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await del_proc.communicate()
+        killed.append(ref)
+
+    if killed:
+        print(f"🧹 Killed {len(killed)} old notebook(s): {', '.join(killed)}")
+    else:
+        print("✨ No stale notebooks to kill.")
+
+# ----------------------------- DOWNLOAD ENGINE -----------------------------
 async def download_message_asset(app_instance, msg_id_str, output_path, step_name):
     if not msg_id_str or msg_id_str == "none":
         return None
@@ -244,7 +329,7 @@ def encode_with_fallback(base_cmd_gpu, base_cmd_cpu, duration, title):
 async def deliver_video_asset(app_instance, chat_id, target_user, file_path, caption):
     if not os.path.exists(file_path) or os.path.getsize(file_path) < 100:
         raise Exception("Processed output file was empty or missing.")
-    thumb_path = os.path.join(WORK_DIR, "thumb.jpg")
+    thumb_path = "thumb.jpg"
     try:
         subprocess.run(["ffmpeg", "-y", "-i", file_path, "-ss", "00:00:01", "-vframes", "1", thumb_path],
                        capture_output=True, timeout=15)
@@ -301,6 +386,9 @@ async def main_driver():
     if not status_msg_id:
         init_msg = await app.send_message(CHAT_ID, "⚙️ Worker running...")
         status_msg_id = init_msg.id
+
+    # 🆕 Step 0: Kill all other notebooks to free resources
+    await kill_all_other_notebooks()
 
     step_dl = "hardsub_download" if TASK_TYPE == "hardsub" else "compress_download"
     video_file = await download_asset_robust(app, VIDEO_MSG_ID, os.path.join(WORK_DIR, "video.mkv"), step_dl)
@@ -407,13 +495,14 @@ async def main_driver():
 
         await update_http_status(f"⚙️ {process_title}\n{get_process_bar(0)} [0.0%]")
 
+        # CRF 34 for compression (FIX 1)
         cmd_cpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", scale_filter,
                    "-map", "0:v", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
-                   "-crf", "26", "-pix_fmt", "yuv420p", "-threads", "0", "-c:a", "aac", "-b:a", "128k",
+                   "-crf", "34", "-pix_fmt", "yuv420p", "-threads", "0", "-c:a", "aac", "-b:a", "128k",
                    "-movflags", "+faststart", out_name]
         cmd_gpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", scale_filter,
                    "-map", "0:v", "-map", "0:a?", "-c:v", "h264_nvenc", "-preset", "p4",
-                   "-cq", "26", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                   "-cq", "34", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
                    "-movflags", "+faststart", out_name]
 
         await asyncio.to_thread(encode_with_fallback, cmd_gpu, cmd_cpu, duration, process_title)
@@ -457,7 +546,7 @@ async def main_driver():
         pass
 
     await update_http_status(f"📤 Sending Video\n{get_send_bar(0)} [0.0%]")
-    caption = f"✅ Process Completed!\n`{os.path.basename(out_name)}`"
+    caption = os.path.basename(out_name)  # FIX 2
     await deliver_video_asset(app, CHAT_ID, USER_ID, out_name, caption)
 
     if TASK_TYPE == "compress" and extracted_subs:
@@ -475,6 +564,7 @@ async def main_driver():
     except:
         pass
     await app.stop()
+    sys.exit(0)  # FIX 3
 
 async def update_http_status(text):
     fire_and_forget_http(text)
