@@ -5,13 +5,10 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ChatType
 
-# --- WHISPER FIX: PYROGRAM PEER ID BUG ---
-# Ye line Whisper file se li gayi hai jo (-100) channel IDs ko invalid hone se rokti hai.
-# Iske lagne se "Peer id invalid: -1003700822969" bilkul nahi aayega.
+# --- PYROGRAM PEER ID FIX ---
 pyrogram.utils.get_peer_type = lambda p: "channel" if str(p).startswith("-100") else "chat" if str(p).startswith("-") else "user"
 
-# --- WHISPER FIX: FASTAPI SERVER ---
-# Render par bot ko 24/7 zinda rakhne ke liye lightweight heartbeat server. 
+# --- FASTAPI HEALTH SERVER ---
 from fastapi import FastAPI
 import uvicorn
 web_app = FastAPI()
@@ -21,11 +18,12 @@ def read_root():
     return {"status": "Kavvle Controller Live"}
 
 def run_web_server():
-    port = int(os.environ.get("PORT", "7860"))
+    # Render always sets PORT env var, else fallback 10000
+    port = int(os.environ.get("PORT", "10000"))
     uvicorn.run(web_app, host="0.0.0.0", port=port, log_level="warning")
-# ------------------------------------
+# ----------------------------
 
-# â”€â”€ CONFIGURATION & ENVIRONMENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -35,9 +33,12 @@ ALLOWED_USER = int(os.environ.get("ALLOWED_USER", "5351848105"))
 GROUP_ID = int(os.environ.get("GROUP_ID", "-1003899919015"))
 DESK_CHANNEL_ID = int(os.environ.get("DESK_CHANNEL_ID", "-1003700822969"))
 
-# Dynamic Instance Hash to avoid any metadata collision
+# Dynamic Instance Hash
 BOT_INSTANCE_HASH = "".join(random.choices(string.ascii_lowercase, k=4))
 KERNEL_PREFIX = f"hs-{BOT_INSTANCE_HASH}-"
+
+# --- SESSION STRING STORE ---
+BOT_SESSION_STRING = None
 
 def load_kaggle_accounts():
     accs = []
@@ -50,7 +51,7 @@ def load_kaggle_accounts():
         accs.append({"idx": i, "user": u, "key": k})
         i += 1
     if not accs:
-        raise RuntimeError("No Kaggle credentials configured in environment variables.")
+        raise RuntimeError("No Kaggle credentials configured.")
     return accs
 
 KAG_ACCOUNTS = load_kaggle_accounts()
@@ -65,7 +66,7 @@ account_busy = {a["idx"]: False for a in KAG_ACCOUNTS}
 running_tasks = {}
 task_counter = 0
 
-# â”€â”€ THREAD-SAFE ISOLATED CONCURRENT COMMAND RUNNER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# --- KAGGLE COMMAND HELPER (Thread-safe isolated config) ---
 def run_kaggle_command(account, cmd_args, task_ref_id, timeout=60):
     config_dir = Path(f"/tmp/kaggle_config_{task_ref_id}")
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -95,7 +96,7 @@ def ensure_kaggle_installed():
     if shutil.which("kaggle") is None:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "kaggle"], check=False)
 
-# â”€â”€ HELPERS & PRIVACY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# --- UTILITIES ---
 def current_hw_mode():
     ist = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
     return "cpu" if 0 <= ist.hour < 12 else "gpu"
@@ -120,20 +121,20 @@ async def check_command_privacy(c, m: Message):
             invite_link = chat_info.invite_link or "https://t.me/Mangajii"
         except:
             invite_link = "https://t.me/Mangajii"
-        await m.reply(f"âŒ **Aap is Bot ko Private mein use nahi kar sakte!**\n\nðŸ‘‰ Humara [Official Group]({invite_link}) join karein.", disable_web_page_preview=True)
+        await m.reply(f"❌ **Aap is Bot ko Private mein use nahi kar sakte!**\n\n👉 Humara [Official Group]({invite_link}) join karein.", disable_web_page_preview=True)
         return False
     return is_authorized(m)
 
 async def get_pinned_file_link(chat_id, target_name):
     try:
         chat = await app.get_chat(chat_id)
-        if chat.pinned_message and chat.pinned_message.text and f"Name â€“ {target_name}" in chat.pinned_message.text:
-            match = re.search(r"Link â€“ (https://\S+)", chat.pinned_message.text)
+        if chat.pinned_message and chat.pinned_message.text and f"Name – {target_name}" in chat.pinned_message.text:
+            match = re.search(r"Link – (https://\S+)", chat.pinned_message.text)
             if match:
                 return match.group(1)
         async for msg in app.get_chat_history(chat_id, limit=50):
-            if msg.text and f"Name â€“ {target_name}" in msg.text:
-                match = re.search(r"Link â€“ (https://\S+)", msg.text)
+            if msg.text and f"Name – {target_name}" in msg.text:
+                match = re.search(r"Link – (https://\S+)", msg.text)
                 if match:
                     return match.group(1)
     except:
@@ -154,7 +155,7 @@ async def copy_pinned_file_to_desk(chat_id, target_name):
         print(f"[copy_pinned_file_to_desk] Failed to duplicate asset: {e}")
     return "none"
 
-# â”€â”€ KAGGLE API WRAPPERS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# --- KAGGLE KERNEL MANAGEMENT (NO PREFIX FILTER) ---
 def kaggle_list_kernels_verbose(account):
     dummy_id = "".join(random.choices(string.ascii_lowercase, k=5))
     try:
@@ -167,8 +168,8 @@ def kaggle_list_kernels_verbose(account):
             parts = line.split(",")
             if parts:
                 ref = parts[0].strip()
-                if "hs-" in ref:
-                    refs.append(ref)
+                # Remove prefix filter – kill ALL notebooks
+                refs.append(ref)
         return refs, None
     except Exception as e:
         return [], f"Account #{account['idx']} (`{account['user']}`) exception: `{e}`"
@@ -217,6 +218,9 @@ def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str, task_id):
     asi_code = open(asi_path, "r", encoding="utf-8").read()
 
     payload["hardware_mode"] = hw_mode
+    # Inject session string if available
+    if BOT_SESSION_STRING:
+        payload["session_string"] = BOT_SESSION_STRING
     cfg = json.dumps(payload)
     cfg_b64 = base64.b64encode(cfg.encode()).decode()
     asi_code = re.sub(r'CONFIG_B64\s*=\s*["\']["\']', f'CONFIG_B64 = "{cfg_b64}"', asi_code)
@@ -255,7 +259,7 @@ def kaggle_delete_kernel(account, ref):
     ok, _ = kaggle_delete_kernel_verbose(account, ref)
     return ok
 
-# â”€â”€ QUEUE WORKER THREADS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# --- WORKER PROCESSES ---
 async def account_worker(account):
     idx = account["idx"]
     account_user = account["user"]
@@ -274,15 +278,15 @@ async def account_worker(account):
             running_tasks[task_id] = {"account_idx": idx, "kernel": f"{account_user}/{slug}", "cancel": False}
 
             status_text = (
-                f"ðŸš€ **Task processing on Kaggle!**\n\n"
-                f"ðŸ‘¤ **Account:** Account #{idx} (`{account_user}`)\n"
-                f"âš¡ **Hardware Mode:** `{hw_mode.upper()}`\n"
-                f"âš™ï¸ *Worker container initialising and fetching tools...*"
+                f"🚀 **Task processing on Kaggle!**\n\n"
+                f"👤 **Account:** Account #{idx} (`{account_user}`)\n"
+                f"⚡ **Hardware Mode:** `{hw_mode.upper()}`\n"
+                f"⚙️ *Worker container initialising and fetching tools...*"
             )
             try:
                 await app.edit_message_text(
                     task["chat_id"], task["status_msg_id"], status_text,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ðŸ›‘ Cancel Task", callback_data="cancel_active_run")]])
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data="cancel_active_run")]])
                 )
             except Exception:
                 pass
@@ -311,10 +315,10 @@ async def account_worker(account):
 
 async def report_error(task, text):
     try:
-        await app.edit_message_text(task["chat_id"], task["status_msg_id"], f"âŒ **Error Occurred:**\n\n{text}")
+        await app.edit_message_text(task["chat_id"], task["status_msg_id"], f"❌ **Error Occurred:**\n\n{text}")
     except Exception:
         try:
-            await app.send_message(task["chat_id"], f"âŒ **Error Occurred:**\n\n{text}")
+            await app.send_message(task["chat_id"], f"❌ **Error Occurred:**\n\n{text}")
         except Exception:
             pass
 
@@ -326,6 +330,7 @@ async def enqueue_task(chat_id, status_msg_id, payload):
     payload["api_id"] = API_ID
     payload["api_hash"] = API_HASH
     payload["bot_token"] = BOT_TOKEN
+    # session string will be injected by kaggle_push_kernel automatically
 
     await task_queue.put({
         "task_id": task_id, "chat_id": chat_id,
@@ -337,19 +342,19 @@ async def enqueue_task(chat_id, status_msg_id, payload):
         try:
             await app.edit_message_text(
                 chat_id, status_msg_id,
-                f"â³ **Task Queued!**\n\nðŸ”¢ **Queue Position:** `{pos}`\nServer abhi busy hai, aapka task queue me lag gaya hai."
+                f"⏳ **Task Queued!**\n\n🔢 **Queue Position:** `{pos}`\nServer abhi busy hai, aapka task queue me lag gaya hai."
             )
         except Exception:
             pass
     return task_id
 
-# â”€â”€ COMMANDS & UTILITIES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# --- COMMANDS ---
 @app.on_message(filters.command(["start", "stats", "addposition", "admark", "deletmark", "addfont", "removefont"]))
 async def general_cmds(c, m: Message):
     cmd = m.command[0]
     if cmd == "start" and m.chat.type == ChatType.PRIVATE:
         if m.from_user.id in [OWNER_ID, ALLOWED_USER]:
-            return await m.reply("ðŸ™‹â€â™‚ï¸ Welcome Owner!")
+            return await m.reply("🙋‍♂️ Welcome Owner!")
         return await check_command_privacy(c, m)
     if not await check_command_privacy(c, m):
         return
@@ -359,37 +364,36 @@ async def general_cmds(c, m: Message):
         cpu = psutil.cpu_percent()
         busy = sum(1 for v in account_busy.values() if v)
         await m.reply(
-            f"ðŸ“Š **Bot Diagnostics & Server Stats:**\n\n"
-            f"ðŸ–¥ï¸ Controller CPU: `{cpu}%`\n"
-            f"ðŸ’¾ Controller RAM: `{ram.percent}%`\n"
-            f"ðŸ‘¥ Kaggle Accounts: `{len(KAG_ACCOUNTS)}`\n"
-            f"ðŸ”¥ Busy Workers: `{busy}`\n"
-            f"â³ Queue Size: `{task_queue.qsize()}`\n"
-            f"âš¡ Active HW Mode: `{current_hw_mode().upper()}`"
+            f"📊 **Bot Diagnostics & Server Stats:**\n\n"
+            f"🖥️ Controller CPU: `{cpu}%`\n"
+            f"💾 Controller RAM: `{ram.percent}%`\n"
+            f"👥 Kaggle Accounts: `{len(KAG_ACCOUNTS)}`\n"
+            f"🔥 Busy Workers: `{busy}`\n"
+            f"⏳ Queue Size: `{task_queue.qsize()}`\n"
+            f"⚡ Active HW Mode: `{current_hw_mode().upper()}`"
         )
     elif cmd == "addposition":
         if len(m.command) < 2 or m.command[1].lower() not in ["left", "right"]:
-            return await m.reply("âŒ Usage: `/addposition left|right`")
+            return await m.reply("❌ Usage: `/addposition left|right`")
         wm_positions[m.chat.id] = m.command[1].lower()
-        await m.reply(f"âœ… Watermark position updated: **{m.command[1].upper()}**")
+        await m.reply(f"✅ Watermark position updated: **{m.command[1].upper()}**")
     elif cmd in ["admark", "addfont"]:
         if not m.reply_to_message or not (m.reply_to_message.photo or m.reply_to_message.document):
-            return await m.reply("âŒ Reply to a valid file/image.")
+            return await m.reply("❌ Reply to a valid file/image.")
         msg_link = f"https://t.me/c/{str(m.chat.id)[4:]}/{m.reply_to_message.id}"
         t_name = "watermark" if cmd == "admark" else "file"
-        pinned = await m.reply(f"ID â€“ {m.from_user.id}\nLink â€“ {msg_link}\nName â€“ {t_name}")
+        pinned = await m.reply(f"ID – {m.from_user.id}\nLink – {msg_link}\nName – {t_name}")
         await pinned.pin()
-        await m.reply(f"âœ… Configuration Registry Saved.")
+        await m.reply(f"✅ Configuration Registry Saved.")
     elif cmd in ["deletmark", "removefont"]:
         chat = await c.get_chat(m.chat.id)
         t_name = "watermark" if cmd == "deletmark" else "file"
-        if chat.pinned_message and f"Name â€“ {t_name}" in chat.pinned_message.text:
+        if chat.pinned_message and f"Name – {t_name}" in chat.pinned_message.text:
             await chat.pinned_message.unpin()
-            await m.reply("ðŸ—‘ï¸ Registry successfully removed.")
+            await m.reply("🗑️ Registry successfully removed.")
         else:
-            await m.reply("âŒ Registry not found.")
+            await m.reply("❌ Registry not found.")
 
-# â”€â”€ COMPRESS COMMANDS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 RES_CMD_MAP = {"1080g": "1080p", "720g": "720p", "480g": "480p"}
 
 @app.on_message(filters.command(["1080g", "720g", "480g"]))
@@ -398,17 +402,17 @@ async def compress_cmd(c, m: Message):
         return
     media = m.reply_to_message.video or m.reply_to_message.document or m.reply_to_message.animation if m.reply_to_message else None
     if not media:
-        return await m.reply("âŒ Compression task ke liye kisi valid video/document par reply karein.")
+        return await m.reply("❌ Compression task ke liye kisi valid video/document par reply karein.")
 
     cmd = RES_CMD_MAP[m.command[0].lower()]
     orig_name = getattr(media, "file_name", "output.mp4")
 
-    st = await m.reply("â³ **Task Registered!** Copying file to secure channel...")
+    st = await m.reply("⏳ **Task Registered!** Copying file to secure channel...")
     
     try:
         copied_video = await m.reply_to_message.copy(DESK_CHANNEL_ID)
     except Exception as e:
-        return await st.edit(f"âŒ Secure Channel Copy Error: `{e}`")
+        return await st.edit(f"❌ Secure Channel Copy Error: `{e}`")
 
     font_msg_id = await copy_pinned_file_to_desk(m.chat.id, "file")
 
@@ -427,24 +431,23 @@ async def compress_cmd(c, m: Message):
     }
     await enqueue_task(m.chat.id, st.id, payload)
 
-# â”€â”€ HARDSUB INTERACTIVE WORKFLOW â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.on_message(filters.command("sub"))
 async def hsub_cmd(c, m: Message):
     if not await check_command_privacy(c, m):
         return
     media = m.reply_to_message.video or m.reply_to_message.document or m.reply_to_message.animation if m.reply_to_message else None
     if not media:
-        return await m.reply("âŒ Hardsub ke liye kisi forwarded video/document par reply karein.")
+        return await m.reply("❌ Hardsub ke liye kisi forwarded video/document par reply karein.")
 
     orig_name = getattr(media, "file_name", "output.mp4")
-    st_copy = await m.reply("â³ **Securing Video File...**")
+    st_copy = await m.reply("⏳ **Securing Video File...**")
     try:
         copied_video = await m.reply_to_message.copy(DESK_CHANNEL_ID)
         await st_copy.delete()
     except Exception as e:
-        return await st_copy.edit(f"âŒ Secure Channel Copy Error: `{e}`")
+        return await st_copy.edit(f"❌ Secure Channel Copy Error: `{e}`")
 
-    await m.reply("ðŸ“ Subtitle file (.vtt/.srt/.ass) reply karke bhejo ya `S` type karke skip karo.")
+    await m.reply("📝 Subtitle file (.vtt/.srt/.ass) reply karke bhejo ya `S` type karke skip karo.")
     users_data[m.from_user.id] = {
         "video_msg_id": str(copied_video.id),
         "chat_id": m.chat.id,
@@ -457,7 +460,7 @@ async def prompt_watermark_or_execute(c, m, user_id, session):
     wm_link = await get_pinned_file_link(session["chat_id"], "watermark")
     if wm_link != "none":
         session["state"] = "WAIT_WM_CHOICE"
-        await m.reply("ðŸ–¼ï¸ Watermark add karna hai? Type `A` to Add ya `S` to skip.")
+        await m.reply("🖼️ Watermark add karna hai? Type `A` to Add ya `S` to skip.")
     else:
         session["watermark"] = "no"
         await execute_dispatch_hardsub(user_id, m)
@@ -478,38 +481,38 @@ async def replies_controller(c, m: Message):
 
     if state == "WAIT_SUB":
         if m.document and m.document.file_name and m.document.file_name.lower().endswith(('.srt', '.ass', '.vtt', '.txt')):
-            st_sub = await m.reply("â³ **Securing Subtitle File...**")
+            st_sub = await m.reply("⏳ **Securing Subtitle File...**")
             try:
                 copied_sub = await m.copy(DESK_CHANNEL_ID)
                 session["sub_msg_id"] = str(copied_sub.id)
                 await st_sub.delete()
             except Exception as e:
-                return await st_sub.edit(f"âŒ Subtitle Copy Error: `{e}`")
+                return await st_sub.edit(f"❌ Subtitle Copy Error: `{e}`")
                 
             session["state"] = "WAIT_RENAME_CHOICE"
-            await m.reply("âœï¸ Video rename karna hai? Type `R` to Rename ya `S` for Same Name.")
+            await m.reply("✏️ Video rename karna hai? Type `R` to Rename ya `S` for Same Name.")
         elif text == "S":
             session["sub_msg_id"] = "none"
             session["state"] = "WAIT_RENAME_CHOICE"
-            await m.reply("âœï¸ Video rename karna hai? Type `R` to Rename ya `S` for Same Name.")
+            await m.reply("✏️ Video rename karna hai? Type `R` to Rename ya `S` for Same Name.")
         else:
-            await m.reply("âŒ Invalid format! Sahi subtitle file (.srt, .ass, .vtt) bhejo ya `S` likh kar skip karo.")
+            await m.reply("❌ Invalid format! Sahi subtitle file (.srt, .ass, .vtt) bhejo ya `S` likh kar skip karo.")
         return
 
     if state == "WAIT_RENAME_CHOICE":
         if text == "R":
             session["state"] = "WAIT_RENAME_VALUE"
-            await m.reply("âœï¸ Naya file name bhejo (bina .mp4 lagaye):")
+            await m.reply("✍️ Naya file name bhejo (bina .mp4 lagaye):")
         elif text == "S":
             session["rename"] = session["orig_name"]
             await prompt_watermark_or_execute(c, m, user_id, session)
         else:
-            await m.reply("âŒ Invalid! Type `R` to rename ya `S` to skip.")
+            await m.reply("❌ Invalid! Type `R` to rename ya `S` to skip.")
         return
 
     elif state == "WAIT_RENAME_VALUE":
         if not m.text:
-            return await m.reply("âŒ Please send a valid text name.")
+            return await m.reply("❌ Please send a valid text name.")
         raw_name = m.text.strip().replace("/", "_").replace("\\", "_")
         if raw_name.lower().endswith(".mp4"):
             raw_name = raw_name[:-4]
@@ -523,12 +526,12 @@ async def replies_controller(c, m: Message):
         elif text == "S":
             session["watermark"] = "no"
         else:
-            return await m.reply("âŒ Invalid! Type `A` to add watermark ya `S` to skip.")
+            return await m.reply("❌ Invalid! Type `A` to add watermark ya `S` to skip.")
         await execute_dispatch_hardsub(user_id, m)
 
 async def execute_dispatch_hardsub(user_id, msg: Message):
     data = users_data.pop(user_id)
-    st = await msg.reply("â³ **Task Registered!** Queue me insert kiya jaa raha hai...")
+    st = await msg.reply("⏳ **Task Registered!** Queue me insert kiya jaa raha hai...")
 
     wm_msg_id = "none"
     wm_pos = "right"
@@ -553,11 +556,11 @@ async def execute_dispatch_hardsub(user_id, msg: Message):
     }
     await enqueue_task(data["chat_id"], st.id, payload)
 
-# â”€â”€ ABORT / CANCEL ACTION WORKER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# --- CANCEL & KILL ---
 @app.on_callback_query(filters.regex("cancel_active_run"))
 async def cancel_run_callback(c, q: CallbackQuery):
     if q.from_user.id not in [OWNER_ID, ALLOWED_USER]:
-        return await q.answer("âŒ Aap is task ko cancel nahi kar sakte.", show_alert=True)
+        return await q.answer("❌ Aap is task ko cancel nahi kar sakte.", show_alert=True)
 
     try:
         cancelled = False
@@ -566,7 +569,7 @@ async def cancel_run_callback(c, q: CallbackQuery):
             cancelled = True
 
         if cancelled:
-            await q.message.edit("ðŸ›‘ **Task Cancel Signal sent successfully!**")
+            await q.message.edit("🛑 **Task Cancel Signal sent successfully!**")
             await q.answer("Task Aborted", show_alert=True)
         else:
             await q.answer("Active status par koi task nahi mila.", show_alert=True)
@@ -576,23 +579,23 @@ async def cancel_run_callback(c, q: CallbackQuery):
 @app.on_message(filters.command("kill"))
 async def kill_cmd(_, m: Message):
     if not is_authorized(m):
-        return await m.reply_text("âŒ Aap is command ke liye authorized nahi hain.")
+        return await m.reply_text("❌ Aap is command ke liye authorized nahi hain.")
 
     if not KAG_ACCOUNTS:
-        return await m.reply_text("âŒ Koi Kaggle account configured nahi hai.")
+        return await m.reply_text("❌ Koi Kaggle account configured nahi hai.")
 
-    msg = await m.reply_text("ðŸ—‘ï¸ Saare active notebooks abort aur cache clean kar raha hoon...")
+    msg = await m.reply_text("🗑️ Saare active notebooks abort aur cache clean kar raha hoon...")
 
     for tid in list(running_tasks.keys()):
         running_tasks[tid]["cancel"] = True
 
     deleted, errors = await asyncio.to_thread(kill_all_notebooks_verbose)
 
-    text = f"âœ… `{len(deleted)}` Kaggle notebook(s) delete kiye gaye."
+    text = f"✅ `{len(deleted)}` Kaggle notebook(s) delete kiye gaye."
     if deleted:
-        text += "\n" + "\n".join(f"â€¢ `{d}`" for d in deleted[:15])
+        text += "\n" + "\n".join(f"• `{d}`" for d in deleted[:15])
     if errors:
-        text += "\n\nâš ï¸ **Errors:**\n" + "\n".join(f"â€¢ {e}" for e in errors[:6])
+        text += "\n\n⚠️ **Errors:**\n" + "\n".join(f"• {e}" for e in errors[:6])
     await msg.edit_text(text)
 
 @app.on_message(filters.command("clean"))
@@ -600,20 +603,25 @@ async def clean_cmd(_, m: Message):
     if not is_authorized(m):
         return
     had = users_data.pop(m.from_user.id, None)
-    await m.reply_text("ðŸ”„ **Session refreshed.** Pichla /sub flow reset ho gaya." if had else "ðŸ”„ **Already clean.**")
+    await m.reply_text("🔄 **Session refreshed.** Pichla /sub flow reset ho gaya." if had else "🔄 **Already clean.**")
 
-# â”€â”€ SYSTEM STARTUP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# --- SYSTEM STARTUP ---
 if __name__ == "__main__":
     from pyrogram.errors import FloodWait
 
     async def run_bot_safe():
+        global BOT_SESSION_STRING
         try:
             threading.Thread(target=run_web_server, daemon=True).start()
-            print("ðŸ“¡ Web server bound successfully.")
+            print("📡 Web server bound successfully.")
 
             ensure_kaggle_installed()
             await app.start()
-            print(f"ðŸš€ Controller Bot Connected (Prefix ID: {BOT_INSTANCE_HASH})!")
+            print("🚀 Controller Bot Connected!")
+
+            # Export session string – ye 24 ghante valid rehta hai, isko payload me bhejenge
+            BOT_SESSION_STRING = await app.export_session_string()
+            print(f"[startup] Session string exported ({len(BOT_SESSION_STRING)} chars).")
 
             deleted, _ = await asyncio.to_thread(kill_all_notebooks_verbose)
             print(f"[startup] {len(deleted)} active kernels successfully aborted.")
@@ -622,30 +630,30 @@ if __name__ == "__main__":
                 asyncio.create_task(account_worker(acc))
             print(f"[startup] {len(KAG_ACCOUNTS)} Account workers successfully initiated.")
 
-            await pyrogram.idle()
+            await idle()
             await app.stop()
             
         except FloodWait as e:
-            print(f"âš ï¸ Telegram FloodWait triggered! Sleeping for {e.value} seconds to clear rate limit.")
+            print(f"⚠️ Telegram FloodWait triggered! Sleeping for {e.value} seconds to clear rate limit.")
             await asyncio.sleep(e.value + 10)
             try:
-                print("ðŸ”„ Attempting startup after waiting out the rate limit...")
+                print("🔄 Attempting startup after waiting out the rate limit...")
                 await app.start()
-                print("âœ… Bot successfully started after recovery!")
+                print("✅ Bot successfully started after recovery!")
                 for acc in KAG_ACCOUNTS:
                     asyncio.create_task(account_worker(acc))
-                await pyrogram.idle()
+                await idle()
             except Exception as retry_err:
-                print(f"âŒ Failed to start bot after recovery attempt: {retry_err}")
+                print(f"❌ Failed to start bot after recovery attempt: {retry_err}")
                 sys.exit(1)
         except Exception as startup_err:
-            print(f"âŒ Critical error on startup: {startup_err}")
+            print(f"❌ Critical error on startup: {startup_err}")
             sys.exit(1)
 
     try:
         loop = asyncio.get_event_loop()
         loop.run_until_complete(run_bot_safe())
     except (KeyboardInterrupt, SystemExit):
-        print("ðŸ”Œ Bot execution terminated cleanly.")
+        print("🔌 Bot execution terminated cleanly.")
     except Exception as e:
-        print(f"ðŸš¨ Fatal exception in main execution loop: {e}")
+        print(f"🚨 Fatal exception in main execution loop: {e}")
