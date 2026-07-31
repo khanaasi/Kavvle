@@ -18,7 +18,6 @@ def read_root():
     return {"status": "Kavvle Controller Live"}
 
 def run_web_server():
-    # Render always sets PORT env var, else fallback 10000
     port = int(os.environ.get("PORT", "10000"))
     uvicorn.run(web_app, host="0.0.0.0", port=port, log_level="warning")
 # ----------------------------
@@ -141,6 +140,7 @@ async def get_pinned_file_link(chat_id, target_name):
         pass
     return "none"
 
+# ✅ Updated: now returns file_id directly (fast download)
 async def copy_pinned_file_to_desk(chat_id, target_name):
     link = await get_pinned_file_link(chat_id, target_name)
     if link == "none":
@@ -150,7 +150,13 @@ async def copy_pinned_file_to_desk(chat_id, target_name):
         msg = await app.get_messages(chat_id, msg_id)
         if msg:
             copied = await msg.copy(DESK_CHANNEL_ID)
-            return str(copied.id)
+            if copied.video:
+                return copied.video.file_id
+            elif copied.document:
+                return copied.document.file_id
+            elif copied.photo:
+                return copied.photo.file_id
+            return "none"
     except Exception as e:
         print(f"[copy_pinned_file_to_desk] Failed to duplicate asset: {e}")
     return "none"
@@ -168,7 +174,6 @@ def kaggle_list_kernels_verbose(account):
             parts = line.split(",")
             if parts:
                 ref = parts[0].strip()
-                # Remove prefix filter – kill ALL notebooks
                 refs.append(ref)
         return refs, None
     except Exception as e:
@@ -218,7 +223,6 @@ def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str, task_id):
     asi_code = open(asi_path, "r", encoding="utf-8").read()
 
     payload["hardware_mode"] = hw_mode
-    # Inject session string if available
     if BOT_SESSION_STRING:
         payload["session_string"] = BOT_SESSION_STRING
     cfg = json.dumps(payload)
@@ -330,7 +334,6 @@ async def enqueue_task(chat_id, status_msg_id, payload):
     payload["api_id"] = API_ID
     payload["api_hash"] = API_HASH
     payload["bot_token"] = BOT_TOKEN
-    # session string will be injected by kaggle_push_kernel automatically
 
     await task_queue.put({
         "task_id": task_id, "chat_id": chat_id,
@@ -411,14 +414,16 @@ async def compress_cmd(c, m: Message):
     
     try:
         copied_video = await m.reply_to_message.copy(DESK_CHANNEL_ID)
+        # ✅ File ID nikaalo (fast download ke liye)
+        file_id = copied_video.video.file_id if copied_video.video else copied_video.document.file_id
     except Exception as e:
         return await st.edit(f"❌ Secure Channel Copy Error: `{e}`")
 
-    font_msg_id = await copy_pinned_file_to_desk(m.chat.id, "file")
+    font_msg_id = await copy_pinned_file_to_desk(m.chat.id, "file")  # ab file_id dega
 
     payload = {
         "task_type": "compress",
-        "video_msg_id": str(copied_video.id),
+        "video_msg_id": file_id,               # ab file_id
         "sub_msg_id": "none", 
         "chat_id": str(m.chat.id), 
         "user_id": str(m.from_user.id),
@@ -426,7 +431,7 @@ async def compress_cmd(c, m: Message):
         "wm_msg_id": "none", 
         "wm_pos": "none", 
         "rename": orig_name,
-        "font_msg_id": font_msg_id, 
+        "font_msg_id": font_msg_id,            # ab file_id
         "trigger_msg_id": str(st.id)
     }
     await enqueue_task(m.chat.id, st.id, payload)
@@ -443,13 +448,15 @@ async def hsub_cmd(c, m: Message):
     st_copy = await m.reply("⏳ **Securing Video File...**")
     try:
         copied_video = await m.reply_to_message.copy(DESK_CHANNEL_ID)
+        # ✅ File ID for video
+        file_id = copied_video.video.file_id if copied_video.video else copied_video.document.file_id
         await st_copy.delete()
     except Exception as e:
         return await st_copy.edit(f"❌ Secure Channel Copy Error: `{e}`")
 
     await m.reply("📝 Subtitle file (.vtt/.srt/.ass) reply karke bhejo ya `S` type karke skip karo.")
     users_data[m.from_user.id] = {
-        "video_msg_id": str(copied_video.id),
+        "video_msg_id": file_id,   # ab file_id
         "chat_id": m.chat.id,
         "state": "WAIT_SUB",
         "rename": "none",
@@ -484,7 +491,8 @@ async def replies_controller(c, m: Message):
             st_sub = await m.reply("⏳ **Securing Subtitle File...**")
             try:
                 copied_sub = await m.copy(DESK_CHANNEL_ID)
-                session["sub_msg_id"] = str(copied_sub.id)
+                # ✅ Subtitle file_id
+                session["sub_msg_id"] = copied_sub.document.file_id
                 await st_sub.delete()
             except Exception as e:
                 return await st_sub.edit(f"❌ Subtitle Copy Error: `{e}`")
@@ -536,15 +544,15 @@ async def execute_dispatch_hardsub(user_id, msg: Message):
     wm_msg_id = "none"
     wm_pos = "right"
     if data.get("watermark") == "yes":
-        wm_msg_id = await copy_pinned_file_to_desk(data["chat_id"], "watermark")
+        wm_msg_id = await copy_pinned_file_to_desk(data["chat_id"], "watermark")  # file_id
         wm_pos = wm_positions.get(data["chat_id"], "right")
 
-    font_msg_id = await copy_pinned_file_to_desk(data["chat_id"], "file")
+    font_msg_id = await copy_pinned_file_to_desk(data["chat_id"], "file")  # file_id
 
     payload = {
         "task_type": "hardsub",
-        "video_msg_id": data["video_msg_id"],
-        "sub_msg_id": data.get("sub_msg_id", "none"), 
+        "video_msg_id": data["video_msg_id"],     # already file_id
+        "sub_msg_id": data.get("sub_msg_id", "none"),  # file_id or "none"
         "chat_id": str(data["chat_id"]), 
         "user_id": str(user_id),
         "resolution": "none", 
@@ -576,9 +584,10 @@ async def cancel_run_callback(c, q: CallbackQuery):
     except Exception as e:
         await q.answer(f"Abort Exception: {e}", show_alert=True)
 
-@app.on_message(filters.command("kill"))
+# ✅ Fixed /kill command – ab turant reply dega
+@app.on_message(filters.command("kill") & (filters.user(OWNER_ID) | filters.user(ALLOWED_USER)))
 async def kill_cmd(_, m: Message):
-    if not is_authorized(m):
+    if not is_authorized(m):   # extra safety
         return await m.reply_text("❌ Aap is command ke liye authorized nahi hain.")
 
     if not KAG_ACCOUNTS:
@@ -619,7 +628,6 @@ if __name__ == "__main__":
             await app.start()
             print("🚀 Controller Bot Connected!")
 
-            # Export session string – ye 24 ghante valid rehta hai, isko payload me bhejenge
             BOT_SESSION_STRING = await app.export_session_string()
             print(f"[startup] Session string exported ({len(BOT_SESSION_STRING)} chars).")
 
