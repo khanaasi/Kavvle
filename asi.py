@@ -33,7 +33,7 @@ def report_critical_failure(error_msg):
             chat_id = cfg.get("chat_id")
             msg_id = cfg.get("trigger_msg_id")
         if token and chat_id:
-            text = f"❌ **Kaggle Execution Error Traceback:**\n\n<pre><code class='language-python'>{html.escape(error_msg[:3500])}</code></pre>"
+            text = f"❌ <b>Kaggle Execution Error Traceback:</b>\n\n<pre><code class='language-python'>{html.escape(error_msg[:3500])}</code></pre>"
             payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
             if msg_id:
                 payload["message_id"] = int(msg_id)
@@ -66,13 +66,13 @@ try:
     FONT_MSG_ID = CFG.get("font_msg_id", "none")
     DESK_CHANNEL_ID = -1003700822969
     HW_MODE = CFG.get("hardware_mode", "cpu")
-    SESSION_STRING = CFG.get("session_string", None)  # New: session string for no-authorization login
+    SESSION_STRING = CFG.get("session_string", None)
 except Exception:
     tb = traceback.format_exc()
     report_critical_failure(tb)
     sys.exit(1)
 
-# ----------------------------- DEPENDENCY SYSTEM (with path fix) -----------------------------
+# ----------------------------- DEPENDENCY SYSTEM -----------------------------
 def ensure_deps():
     need = []
     for mod, pip_name in [("pyrogram", "pyrogram"), ("tgcrypto", "tgcrypto"),
@@ -119,28 +119,6 @@ def get_send_bar(percent):
     filled = int(percent / 100 * 20)
     return f"[{'▓' * filled}{'▒' * (20 - filled)}]"
 
-async def prog(current, total, step_name):
-    global last_time, start_time, app
-    now = time.time()
-    if start_time == 0:
-        start_time = now; last_time = now; return
-    if now - last_time > 12 or current >= total:
-        elapsed = now - start_time
-        speed = current / elapsed if elapsed > 0 else 0
-        speed_mb = (speed / 1024) / 1024
-        percent = (current / total) * 100 if total > 0 else 0
-        if "download" in step_name:
-            text = f"📥 **Downloading Video**\n{get_download_bar(percent)} [{percent:.1f}%]\n🚀 Speed: **{speed_mb:.2f} MB/s**\n📦 {current/1048576:.1f}MB / {total/1048576:.1f}MB"
-        else:
-            text = f"📤 **Sending Video**\n{get_send_bar(percent)} [{percent:.1f}%]\n🚀 Speed: **{speed_mb:.2f} MB/s**\n📦 {current/1048576:.1f}MB / {total/1048576:.1f}MB"
-        try:
-            if app and status_msg_id:
-                await app.edit_message_text(CHAT_ID, status_msg_id, text,
-                                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data="cancel_active_run")]]))
-        except:
-            pass
-        last_time = now
-
 def _sync_http_edit(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     payload = {"chat_id": CHAT_ID, "message_id": status_msg_id, "text": text, "parse_mode": "HTML",
@@ -152,6 +130,27 @@ def _sync_http_edit(text):
 
 def fire_and_forget_http(text):
     threading.Thread(target=_sync_http_edit, args=(text,), daemon=True).start()
+
+# --- FLOODWAIT PROOF PROGRESS CALLBACK ---
+def prog(current, total, step_name):
+    global last_time, start_time
+    now = time.time()
+    if start_time == 0:
+        start_time = now
+        last_time = now
+        return
+    if now - last_time > 10 or current >= total:
+        elapsed = now - start_time
+        speed = current / elapsed if elapsed > 0 else 0
+        speed_mb = (speed / 1024) / 1024
+        percent = (current / total) * 100 if total > 0 else 0
+        if "download" in step_name:
+            text = f"📥 <b>Downloading Video</b>\n{get_download_bar(percent)} [{percent:.1f}%]\n🚀 Speed: <b>{speed_mb:.2f} MB/s</b>\n📦 {current/1048576:.1f}MB / {total/1048576:.1f}MB"
+        else:
+            text = f"📤 <b>Sending Video</b>\n{get_send_bar(percent)} [{percent:.1f}%]\n🚀 Speed: <b>{speed_mb:.2f} MB/s</b>\n📦 {current/1048576:.1f}MB / {total/1048576:.1f}MB"
+        
+        fire_and_forget_http(text)
+        last_time = now
 
 # ----------------------------- UTILITY FUNCTIONS -----------------------------
 def get_duration(video_path):
@@ -196,7 +195,6 @@ def convert_to_clean_ass(input_sub, output_ass):
 
 # ----------------------------- KAGGLE NOTEBOOK CLEANUP -----------------------------
 async def kill_all_other_notebooks():
-    """Kill all active Kaggle notebooks for the current account except this one."""
     username = os.environ.get("KAGGLE_USERNAME", "").strip()
     api_key = os.environ.get("KAGGLE_KEY", "").strip()
     current_kernel = os.environ.get("KAGGLE_KERNEL_NAME", "").strip()
@@ -371,7 +369,6 @@ async def deliver_video_asset(app_instance, chat_id, target_user, file_path, cap
 async def main_driver():
     global status_msg_id, app
 
-    # --- FIRST SESSION (DOWNLOAD) USING SESSION STRING ---
     if SESSION_STRING:
         app = Client("worker_down", api_id=API_ID, api_hash=API_HASH,
                      session_string=SESSION_STRING,
@@ -390,7 +387,6 @@ async def main_driver():
         init_msg = await app.send_message(CHAT_ID, "⚙️ Worker running...")
         status_msg_id = init_msg.id
 
-    # Kill other notebooks (except self)
     await kill_all_other_notebooks()
 
     step_dl = "hardsub_download" if TASK_TYPE == "hardsub" else "compress_download"
@@ -498,7 +494,6 @@ async def main_driver():
 
         await update_http_status(f"⚙️ {process_title}\n{get_process_bar(0)} [0.0%]")
 
-        # CRF 34 compression
         cmd_cpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", scale_filter,
                    "-map", "0:v", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
                    "-crf", "34", "-pix_fmt", "yuv420p", "-threads", "0", "-c:a", "aac", "-b:a", "128k",
@@ -539,7 +534,6 @@ async def main_driver():
 
         await asyncio.to_thread(encode_with_fallback, cmd_gpu, cmd_cpu, duration, process_title)
 
-    # --- SECOND SESSION (UPLOAD) USING SESSION STRING ---
     if SESSION_STRING:
         app = Client("worker_up", api_id=API_ID, api_hash=API_HASH,
                      session_string=SESSION_STRING,
@@ -554,7 +548,7 @@ async def main_driver():
         pass
 
     await update_http_status(f"📤 Sending Video\n{get_send_bar(0)} [0.0%]")
-    caption = os.path.basename(out_name)  # FIX 2
+    caption = os.path.basename(out_name)
     await deliver_video_asset(app, CHAT_ID, USER_ID, out_name, caption)
 
     if TASK_TYPE == "compress" and extracted_subs:
@@ -572,7 +566,7 @@ async def main_driver():
     except:
         pass
     await app.stop()
-    sys.exit(0)  # FIX 3
+    sys.exit(0)
 
 async def update_http_status(text):
     fire_and_forget_http(text)
