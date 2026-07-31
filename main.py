@@ -1,651 +1,527 @@
-import os, re, json, base64, asyncio, subprocess, datetime, http.server, threading, psutil, shutil, sys, random, string
-from pathlib import Path
-import pyrogram.utils
-from pyrogram import Client, filters, idle
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from pyrogram.enums import ChatType
+import os, sys, site, importlib, importlib.util, importlib.metadata, traceback
+import time, asyncio, subprocess, json, gc, re, base64, requests, html, shutil, threading
 
-# --- WHISPER FIX: PYROGRAM PEER ID BUG ---
-# Ye line Whisper file se li gayi hai jo (-100) channel IDs ko invalid hone se rokti hai.
-# Iske lagne se "Peer id invalid: -1003700822969" bilkul nahi aayega.
+# ----------------------------- EARLY PATH SETUP -----------------------------
+def _ensure_user_site_path():
+    user_site = site.getusersitepackages()
+    if os.path.exists(user_site) and user_site not in sys.path:
+        sys.path.insert(0, user_site)
+
+_ensure_user_site_path()
+# -----------------------------------------------------------------------------
+
+WORK_DIR = "/kaggle/working" if os.path.exists("/kaggle") else "/tmp/kavvle_work"
+os.makedirs(WORK_DIR, exist_ok=True)
+os.chdir(WORK_DIR)
+
+# Globals
+last_time = 0
+start_time = 0
+status_msg_id = None
+app = None
+
+CONFIG_B64 = ""
+
+def report_critical_failure(error_msg):
+    try:
+        token = os.environ.get("BOT_TOKEN")
+        chat_id = os.environ.get("CHAT_ID")
+        msg_id = os.environ.get("TRIGGER_MSG_ID")
+        if (not token or not chat_id) and CONFIG_B64:
+            cfg = json.loads(base64.b64decode(CONFIG_B64).decode())
+            token = cfg.get("bot_token")
+            chat_id = cfg.get("chat_id")
+            msg_id = cfg.get("trigger_msg_id")
+        if token and chat_id:
+            text = f"❌ **Kaggle Execution Error Traceback:**\n\n<pre><code class='language-python'>{html.escape(error_msg[:3500])}</code></pre>"
+            payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+            if msg_id:
+                payload["message_id"] = int(msg_id)
+                requests.post(f"https://api.telegram.org/bot{token}/editMessageText", json=payload, timeout=10)
+            else:
+                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload, timeout=10)
+    except:
+        pass
+
+try:
+    def load_config():
+        if not CONFIG_B64:
+            raise RuntimeError("CONFIG_B64 missing")
+        return json.loads(base64.b64decode(CONFIG_B64).decode())
+
+    CFG = load_config()
+    API_ID = int(CFG["api_id"])
+    API_HASH = CFG["api_hash"]
+    BOT_TOKEN = CFG["bot_token"]
+    TASK_TYPE = CFG["task_type"]
+    CHAT_ID = int(CFG["chat_id"])
+    USER_ID = int(CFG.get("user_id") or CFG["chat_id"])
+    RESOLUTION = CFG.get("resolution", "none")
+    WM_POS = CFG.get("wm_pos", "right")
+    RENAME = CFG.get("rename", "none")
+    TRIGGER_MSG_ID = CFG.get("trigger_msg_id")
+    VIDEO_MSG_ID = CFG.get("video_msg_id", "none")
+    SUB_MSG_ID = CFG.get("sub_msg_id", "none")
+    WM_MSG_ID = CFG.get("wm_msg_id", "none")
+    FONT_MSG_ID = CFG.get("font_msg_id", "none")
+    DESK_CHANNEL_ID = -1003700822969
+    HW_MODE = CFG.get("hardware_mode", "cpu")
+except Exception:
+    tb = traceback.format_exc()
+    report_critical_failure(tb)
+    sys.exit(1)
+
+# ----------------------------- DEPENDENCY SYSTEM (with path fix) -----------------------------
+def ensure_deps():
+    need = []
+    for mod, pip_name in [("pyrogram", "pyrogram"), ("tgcrypto", "tgcrypto"),
+                          ("pysubs2", "pysubs2"), ("fontTools", "fonttools")]:
+        if importlib.util.find_spec(mod) is None:
+            need.append(pip_name)
+    if need:
+        print(f"📦 Installing missing packages: {need}")
+        cmd = [sys.executable, "-m", "pip", "install", "-q", "--user", "--no-cache-dir", *need]
+        try:
+            subprocess.run(cmd, check=True)
+        except Exception:
+            subprocess.run(cmd, check=False)
+        # Crucial: after install, add user site-packages to path again
+        _ensure_user_site_path()
+        importlib.invalidate_caches()
+
+ensure_deps()
+
+import pyrogram.utils, pysubs2
+from pyrogram import Client
+from pyrogram.enums import ParseMode
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from fontTools.ttLib import TTFont
+
 pyrogram.utils.get_peer_type = lambda p: "channel" if str(p).startswith("-100") else "chat" if str(p).startswith("-") else "user"
 
-# --- WHISPER FIX: FASTAPI SERVER ---
-# Render par bot ko 24/7 zinda rakhne ke liye lightweight heartbeat server. 
-from fastapi import FastAPI
-import uvicorn
-web_app = FastAPI()
+# ----------------------------- PROGRESS UI HELPERS -----------------------------
+def reset_prog():
+    global last_time, start_time
+    last_time = time.time()
+    start_time = time.time()
 
-@web_app.get("/")
-def read_root():
-    return {"status": "Kavvle Controller Live"}
+def get_download_bar(percent):
+    filled = int(percent / 100 * 20)
+    return f"[{'>' * filled}{'-' * (20 - filled)}]"
 
-def run_web_server():
-    port = int(os.environ.get("PORT", "7860"))
-    uvicorn.run(web_app, host="0.0.0.0", port=port, log_level="warning")
-# ------------------------------------
+def get_process_bar(percent):
+    filled = int(percent / 100 * 20)
+    seq = ["•", "°", ":", "°", "•", ":"]
+    bar = "".join(seq[i % len(seq)] for i in range(filled))
+    return f"[{bar}{'-' * (20 - filled)}]"
 
-# ── CONFIGURATION & ENVIRONMENT ──────────────────────────────────────
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "").strip()
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+def get_send_bar(percent):
+    filled = int(percent / 100 * 20)
+    return f"[{'▓' * filled}{'▒' * (20 - filled)}]"
 
-OWNER_ID = int(os.environ.get("OWNER_ID", "5344078567"))
-ALLOWED_USER = int(os.environ.get("ALLOWED_USER", "5351848105"))
-GROUP_ID = int(os.environ.get("GROUP_ID", "-1003899919015"))
-DESK_CHANNEL_ID = int(os.environ.get("DESK_CHANNEL_ID", "-1003700822969"))
-
-# Dynamic Instance Hash to avoid any metadata collision
-BOT_INSTANCE_HASH = "".join(random.choices(string.ascii_lowercase, k=4))
-KERNEL_PREFIX = f"hs-{BOT_INSTANCE_HASH}-"
-
-def load_kaggle_accounts():
-    accs = []
-    i = 1
-    while True:
-        u = os.environ.get(f"KAG_USER{i}")
-        k = os.environ.get(f"KAG_KEY{i}")
-        if not u or not k:
-            break
-        accs.append({"idx": i, "user": u, "key": k})
-        i += 1
-    if not accs:
-        raise RuntimeError("No Kaggle credentials configured in environment variables.")
-    return accs
-
-KAG_ACCOUNTS = load_kaggle_accounts()
-
-app = Client("HarsubBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=16)
-
-users_data = {}
-wm_positions = {}
-
-task_queue = asyncio.Queue()
-account_busy = {a["idx"]: False for a in KAG_ACCOUNTS}
-running_tasks = {}
-task_counter = 0
-
-# ── THREAD-SAFE ISOLATED CONCURRENT COMMAND RUNNER ────────────────────
-def run_kaggle_command(account, cmd_args, task_ref_id, timeout=60):
-    config_dir = Path(f"/tmp/kaggle_config_{task_ref_id}")
-    config_dir.mkdir(parents=True, exist_ok=True)
-
-    creds_file = config_dir / "kaggle.json"
-    with open(creds_file, "w", encoding="utf-8") as f:
-        json.dump({"username": account["user"], "key": account["key"]}, f)
-    try:
-        creds_file.chmod(0o600)
-    except:
-        pass
-
-    env = os.environ.copy()
-    env["KAGGLE_CONFIG_DIR"] = str(config_dir)
-    env["KAGGLE_USERNAME"] = account["user"]
-    env["KAGGLE_KEY"] = account["key"]
-
-    res = subprocess.run(cmd_args, env=env, capture_output=True, text=True, timeout=timeout)
-
-    try:
-        shutil.rmtree(config_dir)
-    except:
-        pass
-    return res
-
-def ensure_kaggle_installed():
-    if shutil.which("kaggle") is None:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "kaggle"], check=False)
-
-# ── HELPERS & PRIVACY ────────────────────────────────────────────────
-def current_hw_mode():
-    ist = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
-    return "cpu" if 0 <= ist.hour < 12 else "gpu"
-
-def is_authorized(m: Message):
-    if not m.from_user:
-        return False
-    u_id = m.from_user.id
-    if u_id in [OWNER_ID, ALLOWED_USER]:
-        return True
-    if m.chat and m.chat.id == GROUP_ID:
-        return True
-    return False
-
-async def check_command_privacy(c, m: Message):
-    is_pm = m.chat.type == ChatType.PRIVATE
-    if is_pm and m.from_user.id in [OWNER_ID, ALLOWED_USER]:
-        return True
-    if is_pm:
+async def prog(current, total, step_name):
+    global last_time, start_time, app
+    now = time.time()
+    if start_time == 0:
+        start_time = now; last_time = now; return
+    if now - last_time > 12 or current >= total:
+        elapsed = now - start_time
+        speed = current / elapsed if elapsed > 0 else 0
+        speed_mb = (speed / 1024) / 1024
+        percent = (current / total) * 100 if total > 0 else 0
+        if "download" in step_name:
+            text = f"📥 **Downloading Video**\n{get_download_bar(percent)} [{percent:.1f}%]\n🚀 Speed: **{speed_mb:.2f} MB/s**\n📦 {current/1048576:.1f}MB / {total/1048576:.1f}MB"
+        else:
+            text = f"📤 **Sending Video**\n{get_send_bar(percent)} [{percent:.1f}%]\n🚀 Speed: **{speed_mb:.2f} MB/s**\n📦 {current/1048576:.1f}MB / {total/1048576:.1f}MB"
         try:
-            chat_info = await c.get_chat(GROUP_ID)
-            invite_link = chat_info.invite_link or "https://t.me/Mangajii"
+            if app and status_msg_id:
+                await app.edit_message_text(CHAT_ID, status_msg_id, text,
+                                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data="cancel_active_run")]]))
         except:
-            invite_link = "https://t.me/Mangajii"
-        await m.reply(f"❌ **Aap is Bot ko Private mein use nahi kar sakte!**\n\n👉 Humara [Official Group]({invite_link}) join karein.", disable_web_page_preview=True)
+            pass
+        last_time = now
+
+def _sync_http_edit(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+    payload = {"chat_id": CHAT_ID, "message_id": status_msg_id, "text": text, "parse_mode": "HTML",
+               "reply_markup": {"inline_keyboard": [[{"text": "🛑 Cancel Task", "callback_data": "cancel_active_run"}]]}}
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except:
+        pass
+
+def fire_and_forget_http(text):
+    threading.Thread(target=_sync_http_edit, args=(text,), daemon=True).start()
+
+# ----------------------------- UTILITY FUNCTIONS -----------------------------
+def get_duration(video_path):
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+                            capture_output=True, text=True, timeout=10)
+        return float(r.stdout.strip()) if r.stdout.strip() else 0.0
+    except:
+        return 0
+
+def get_font_name(font_path):
+    try:
+        font = TTFont(font_path)
+        for record in font['name'].names:
+            if record.nameID == 4:
+                return record.toUnicode()
+    except:
+        pass
+    return "Arial"
+
+def is_ass_format(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            head = f.read(4000)
+        return bool(re.search(r'\[Script Info\]|\[V4\+?\s*Styles\]|\[Events\]', head, re.IGNORECASE))
+    except:
         return False
-    return is_authorized(m)
 
-async def get_pinned_file_link(chat_id, target_name):
+def convert_to_clean_ass(input_sub, output_ass):
     try:
-        chat = await app.get_chat(chat_id)
-        if chat.pinned_message and chat.pinned_message.text and f"Name – {target_name}" in chat.pinned_message.text:
-            match = re.search(r"Link – (https://\S+)", chat.pinned_message.text)
-            if match:
-                return match.group(1)
-        async for msg in app.get_chat_history(chat_id, limit=50):
-            if msg.text and f"Name – {target_name}" in msg.text:
-                match = re.search(r"Link – (https://\S+)", msg.text)
-                if match:
-                    return match.group(1)
-    except:
-        pass
-    return "none"
-
-async def copy_pinned_file_to_desk(chat_id, target_name):
-    link = await get_pinned_file_link(chat_id, target_name)
-    if link == "none":
-        return "none"
-    try:
-        msg_id = int(link.rstrip("/").split("/")[-1])
-        msg = await app.get_messages(chat_id, msg_id)
-        if msg:
-            copied = await msg.copy(DESK_CHANNEL_ID)
-            return str(copied.id)
-    except Exception as e:
-        print(f"[copy_pinned_file_to_desk] Failed to duplicate asset: {e}")
-    return "none"
-
-# ── KAGGLE API WRAPPERS ──────────────────────────────────────────────
-def kaggle_list_kernels_verbose(account):
-    dummy_id = "".join(random.choices(string.ascii_lowercase, k=5))
-    try:
-        out = run_kaggle_command(account, ["kaggle", "kernels", "list", "--user", account["user"], "--csv"], dummy_id, timeout=45)
-        if out.returncode != 0:
-            return [], f"Account #{account['idx']} (`{account['user']}`) list fail: `{(out.stderr or out.stdout).strip()[:200]}`"
-        lines = out.stdout.strip().splitlines()
-        refs = []
-        for line in lines[1:]:
-            parts = line.split(",")
-            if parts:
-                ref = parts[0].strip()
-                if "hs-" in ref:
-                    refs.append(ref)
-        return refs, None
-    except Exception as e:
-        return [], f"Account #{account['idx']} (`{account['user']}`) exception: `{e}`"
-
-def kaggle_delete_kernel_verbose(account, ref):
-    dummy_id = "".join(random.choices(string.ascii_lowercase, k=5))
-    try:
-        res = run_kaggle_command(account, ["kaggle", "kernels", "delete", "-k", ref], dummy_id, timeout=45)
-        if res.returncode == 0:
-            return True, None
-        return False, f"`{ref}` delete fail: `{(res.stderr or res.stdout).strip()[:150]}`"
-    except Exception as e:
-        return False, f"`{ref}` exception: `{e}`"
-
-def kaggle_kernel_status(account, ref):
-    dummy_id = "".join(random.choices(string.ascii_lowercase, k=5))
-    try:
-        out = run_kaggle_command(account, ["kaggle", "kernels", "status", ref], dummy_id, timeout=30)
-        return out.stdout.strip()
-    except Exception as e:
-        return str(e)
-
-def kill_all_notebooks_verbose():
-    deleted, errors = [], []
-    for acc in KAG_ACCOUNTS:
-        refs, err = kaggle_list_kernels_verbose(acc)
-        if err:
-            errors.append(err)
-            continue
-        for ref in refs:
-            ok, derr = kaggle_delete_kernel_verbose(acc, ref)
-            if ok:
-                deleted.append(ref)
-            else:
-                errors.append(derr)
-    return deleted, errors
-
-def kaggle_push_kernel(account, slug, payload: dict, hw_mode: str, task_id):
-    workdir = f"/tmp/{slug}"
-    os.makedirs(workdir, exist_ok=True)
-
-    asi_path = os.path.join(os.path.dirname(__file__), "asi.py")
-    if not os.path.exists(asi_path):
-        return False, "Error: asi.py template missing on controller!"
-
-    asi_code = open(asi_path, "r", encoding="utf-8").read()
-
-    payload["hardware_mode"] = hw_mode
-    cfg = json.dumps(payload)
-    cfg_b64 = base64.b64encode(cfg.encode()).decode()
-    asi_code = re.sub(r'CONFIG_B64\s*=\s*["\']["\']', f'CONFIG_B64 = "{cfg_b64}"', asi_code)
-
-    with open(os.path.join(workdir, f"{slug}.py"), "w", encoding="utf-8") as f:
-        f.write(asi_code)
-
-    meta = {
-        "id": f"{account['user']}/{slug}",
-        "title": slug,
-        "code_file": f"{slug}.py",
-        "language": "python",
-        "kernel_type": "script",
-        "is_private": True,
-        "enable_gpu": hw_mode == "gpu",
-        "enable_internet": True,
-        "keywords": [],
-        "dataset_sources": [],
-        "kernel_sources": [],
-        "competition_sources": [],
-        "model_sources": []
-    }
-    with open(os.path.join(workdir, "kernel-metadata.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f)
-
-    out = run_kaggle_command(account, ["kaggle", "kernels", "push", "-p", workdir], task_id, timeout=90)
-
-    try:
-        shutil.rmtree(workdir)
+        subs = pysubs2.load(input_sub)
+        subs.styles["Default"] = pysubs2.SSAStyle(fontname="Arial", fontsize=24,
+            primarycolor=pysubs2.Color(255, 255, 255), outlinecolor=pysubs2.Color(0, 0, 0),
+            outline=2, shadow=1, marginl=20, marginr=20, marginv=15)
+        for line in subs:
+            line.style = "Default"
+            line.text = re.sub(r'<[^>]+>', '', re.sub(r'\{[^}]+\}', '', line.text)).replace('\r', '').replace('\n', '\\N').strip()
+        subs.save(output_ass)
     except:
         pass
 
-    return out.returncode == 0, out.stdout + out.stderr
-
-def kaggle_delete_kernel(account, ref):
-    ok, _ = kaggle_delete_kernel_verbose(account, ref)
-    return ok
-
-# ── QUEUE WORKER THREADS ─────────────────────────────────────────────
-async def account_worker(account):
-    idx = account["idx"]
-    account_user = account["user"]
-    while True:
-        task = await task_queue.get()
-        if task.get("cancelled"):
-            task_queue.task_done()
-            continue
-        task_id = task["task_id"]
-        task_hash = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
-        slug = f"{KERNEL_PREFIX}{task_id}-{task_hash}"
-
-        try:
-            account_busy[idx] = True
-            hw_mode = current_hw_mode()
-            running_tasks[task_id] = {"account_idx": idx, "kernel": f"{account_user}/{slug}", "cancel": False}
-
-            status_text = (
-                f"🚀 **Task processing on Kaggle!**\n\n"
-                f"👤 **Account:** Account #{idx} (`{account_user}`)\n"
-                f"⚡ **Hardware Mode:** `{hw_mode.upper()}`\n"
-                f"⚙️ *Worker container initialising and fetching tools...*"
-            )
-            try:
-                await app.edit_message_text(
-                    task["chat_id"], task["status_msg_id"], status_text,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Task", callback_data="cancel_active_run")]])
-                )
-            except Exception:
-                pass
-
-            ok, log = await asyncio.to_thread(kaggle_push_kernel, account, slug, task["payload"], hw_mode, task_id)
-            if not ok:
-                await report_error(task, f"Kaggle push fail (account {idx}):\n{log[-800:]}")
-                continue
-
-            for _ in range(2160):
-                if running_tasks.get(task_id, {}).get("cancel"):
-                    await asyncio.to_thread(kaggle_delete_kernel, account, f"{account_user}/{slug}")
-                    break
-                st = await asyncio.to_thread(kaggle_kernel_status, account, f"{account_user}/{slug}")
-                if "complete" in st.lower() or "error" in st.lower() or "cancel" in st.lower():
-                    break
-                await asyncio.sleep(20)
-
-            await asyncio.to_thread(kaggle_delete_kernel, account, f"{account_user}/{slug}")
-        except Exception as e:
-            await report_error(task, f"Worker exception occurred: {e}")
-        finally:
-            account_busy[idx] = False
-            running_tasks.pop(task_id, None)
-            task_queue.task_done()
-
-async def report_error(task, text):
+# ----------------------------- DOWNLOAD ENGINE -----------------------------
+async def download_message_asset(app_instance, msg_id_str, output_path, step_name):
+    if not msg_id_str or msg_id_str == "none":
+        return None
     try:
-        await app.edit_message_text(task["chat_id"], task["status_msg_id"], f"❌ **Error Occurred:**\n\n{text}")
-    except Exception:
-        try:
-            await app.send_message(task["chat_id"], f"❌ **Error Occurred:**\n\n{text}")
-        except Exception:
-            pass
-
-async def enqueue_task(chat_id, status_msg_id, payload):
-    global task_counter
-    task_counter += 1
-    task_id = task_counter
-    payload["trigger_msg_id"] = str(status_msg_id)
-    payload["api_id"] = API_ID
-    payload["api_hash"] = API_HASH
-    payload["bot_token"] = BOT_TOKEN
-
-    await task_queue.put({
-        "task_id": task_id, "chat_id": chat_id,
-        "status_msg_id": status_msg_id, "payload": payload
-    })
-
-    pos = task_queue.qsize()
-    if pos > 0:
-        try:
-            await app.edit_message_text(
-                chat_id, status_msg_id,
-                f"⏳ **Task Queued!**\n\n🔢 **Queue Position:** `{pos}`\nServer abhi busy hai, aapka task queue me lag gaya hai."
-            )
-        except Exception:
-            pass
-    return task_id
-
-# ── COMMANDS & UTILITIES ─────────────────────────────────────────────
-@app.on_message(filters.command(["start", "stats", "addposition", "admark", "deletmark", "addfont", "removefont"]))
-async def general_cmds(c, m: Message):
-    cmd = m.command[0]
-    if cmd == "start" and m.chat.type == ChatType.PRIVATE:
-        if m.from_user.id in [OWNER_ID, ALLOWED_USER]:
-            return await m.reply("🙋‍♂️ Welcome Owner!")
-        return await check_command_privacy(c, m)
-    if not await check_command_privacy(c, m):
-        return
-
-    if cmd == "stats":
-        ram = psutil.virtual_memory()
-        cpu = psutil.cpu_percent()
-        busy = sum(1 for v in account_busy.values() if v)
-        await m.reply(
-            f"📊 **Bot Diagnostics & Server Stats:**\n\n"
-            f"🖥️ Controller CPU: `{cpu}%`\n"
-            f"💾 Controller RAM: `{ram.percent}%`\n"
-            f"👥 Kaggle Accounts: `{len(KAG_ACCOUNTS)}`\n"
-            f"🔥 Busy Workers: `{busy}`\n"
-            f"⏳ Queue Size: `{task_queue.qsize()}`\n"
-            f"⚡ Active HW Mode: `{current_hw_mode().upper()}`"
+        msg_id = int(msg_id_str)
+        msg = await app_instance.get_messages(DESK_CHANNEL_ID, msg_id)
+        if not msg:
+            raise Exception(f"Mirrored asset {msg_id} was removed from logging channel.")
+        media = msg.document or msg.video or msg.audio or msg.photo or msg.animation
+        if not media:
+            raise Exception("No valid downloadable stream in secured message.")
+        reset_prog()
+        result = await asyncio.wait_for(
+            app_instance.download_media(msg, file_name=output_path, progress=prog, progress_args=(step_name,)),
+            timeout=1800
         )
-    elif cmd == "addposition":
-        if len(m.command) < 2 or m.command[1].lower() not in ["left", "right"]:
-            return await m.reply("❌ Usage: `/addposition left|right`")
-        wm_positions[m.chat.id] = m.command[1].lower()
-        await m.reply(f"✅ Watermark position updated: **{m.command[1].upper()}**")
-    elif cmd in ["admark", "addfont"]:
-        if not m.reply_to_message or not (m.reply_to_message.photo or m.reply_to_message.document):
-            return await m.reply("❌ Reply to a valid file/image.")
-        msg_link = f"https://t.me/c/{str(m.chat.id)[4:]}/{m.reply_to_message.id}"
-        t_name = "watermark" if cmd == "admark" else "file"
-        pinned = await m.reply(f"ID – {m.from_user.id}\nLink – {msg_link}\nName – {t_name}")
-        await pinned.pin()
-        await m.reply(f"✅ Configuration Registry Saved.")
-    elif cmd in ["deletmark", "removefont"]:
-        chat = await c.get_chat(m.chat.id)
-        t_name = "watermark" if cmd == "deletmark" else "file"
-        if chat.pinned_message and f"Name – {t_name}" in chat.pinned_message.text:
-            await chat.pinned_message.unpin()
-            await m.reply("🗑️ Registry successfully removed.")
-        else:
-            await m.reply("❌ Registry not found.")
-
-# ── COMPRESS COMMANDS ────────────────────────────────────────────────
-RES_CMD_MAP = {"1080g": "1080p", "720g": "720p", "480g": "480p"}
-
-@app.on_message(filters.command(["1080g", "720g", "480g"]))
-async def compress_cmd(c, m: Message):
-    if not await check_command_privacy(c, m):
-        return
-    media = m.reply_to_message.video or m.reply_to_message.document or m.reply_to_message.animation if m.reply_to_message else None
-    if not media:
-        return await m.reply("❌ Compression task ke liye kisi valid video/document par reply karein.")
-
-    cmd = RES_CMD_MAP[m.command[0].lower()]
-    orig_name = getattr(media, "file_name", "output.mp4")
-
-    st = await m.reply("⏳ **Task Registered!** Copying file to secure channel...")
-    
-    try:
-        copied_video = await m.reply_to_message.copy(DESK_CHANNEL_ID)
+        if not result or not os.path.exists(result):
+            raise Exception("Mirrored file failed to write successfully.")
+        return result
     except Exception as e:
-        return await st.edit(f"❌ Secure Channel Copy Error: `{e}`")
+        raise Exception(f"Download Error on secured step '{step_name}': {type(e).__name__}: {e}")
 
-    font_msg_id = await copy_pinned_file_to_desk(m.chat.id, "file")
-
-    payload = {
-        "task_type": "compress",
-        "video_msg_id": str(copied_video.id),
-        "sub_msg_id": "none", 
-        "chat_id": str(m.chat.id), 
-        "user_id": str(m.from_user.id),
-        "resolution": cmd, 
-        "wm_msg_id": "none", 
-        "wm_pos": "none", 
-        "rename": orig_name,
-        "font_msg_id": font_msg_id, 
-        "trigger_msg_id": str(st.id)
-    }
-    await enqueue_task(m.chat.id, st.id, payload)
-
-# ── HARDSUB INTERACTIVE WORKFLOW ─────────────────────────────────────
-@app.on_message(filters.command("sub"))
-async def hsub_cmd(c, m: Message):
-    if not await check_command_privacy(c, m):
-        return
-    media = m.reply_to_message.video or m.reply_to_message.document or m.reply_to_message.animation if m.reply_to_message else None
-    if not media:
-        return await m.reply("❌ Hardsub ke liye kisi forwarded video/document par reply karein.")
-
-    orig_name = getattr(media, "file_name", "output.mp4")
-    st_copy = await m.reply("⏳ **Securing Video File...**")
+async def download_by_file_id(app_instance, file_id, output_path, step_name):
+    if not file_id or file_id == "none":
+        return None
     try:
-        copied_video = await m.reply_to_message.copy(DESK_CHANNEL_ID)
-        await st_copy.delete()
+        reset_prog()
+        result = await asyncio.wait_for(
+            app_instance.download_media(file_id, file_name=output_path, progress=prog, progress_args=(step_name,)),
+            timeout=1800
+        )
+        if not result or not os.path.exists(result):
+            raise Exception("File path failed to register on fallback.")
+        return result
     except Exception as e:
-        return await st_copy.edit(f"❌ Secure Channel Copy Error: `{e}`")
+        raise Exception(f"Fallback download failed on '{step_name}': {type(e).__name__}: {e}")
 
-    await m.reply("📝 Subtitle file (.vtt/.srt/.ass) reply karke bhejo ya `S` type karke skip karo.")
-    users_data[m.from_user.id] = {
-        "video_msg_id": str(copied_video.id),
-        "chat_id": m.chat.id,
-        "state": "WAIT_SUB",
-        "rename": "none",
-        "orig_name": orig_name
-    }
+async def download_asset_robust(app_instance, val, output_path, step_name):
+    if not val or val == "none":
+        return None
+    if str(val).isdigit():
+        return await download_message_asset(app_instance, val, output_path, step_name)
+    return await download_by_file_id(app_instance, val, output_path, step_name)
 
-async def prompt_watermark_or_execute(c, m, user_id, session):
-    wm_link = await get_pinned_file_link(session["chat_id"], "watermark")
-    if wm_link != "none":
-        session["state"] = "WAIT_WM_CHOICE"
-        await m.reply("🖼️ Watermark add karna hai? Type `A` to Add ya `S` to skip.")
-    else:
-        session["watermark"] = "no"
-        await execute_dispatch_hardsub(user_id, m)
+# ----------------------------- ENCODING ENGINE -----------------------------
+def run_ffmpeg_sync(cmd, duration, process_title):
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    last_edit = time.time()
+    log_tail = []
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        if "out_time_us=" not in line and "frame=" not in line:
+            log_tail.append(line)
+            if len(log_tail) > 20:
+                log_tail.pop(0)
+        if "out_time_us=" in line and duration > 0:
+            now = time.time()
+            if now - last_edit > 10:
+                try:
+                    us = int(line.split("=")[1])
+                    percent = min((us / 1_000_000.0 / duration) * 100, 100.0)
+                    fire_and_forget_http(f"⚙️ {process_title}\n{get_process_bar(percent)} [{percent:.1f}%]")
+                except:
+                    pass
+                last_edit = now
+    proc.wait()
+    return proc.returncode, log_tail
 
-@app.on_message(filters.text | filters.document)
-async def replies_controller(c, m: Message):
-    if not m.from_user or (m.text and m.text.startswith("/")):
-        return
-    user_id = m.from_user.id
-    if user_id not in users_data:
-        return
-    session = users_data[user_id]
-    if session["chat_id"] != m.chat.id:
-        return
+def encode_with_fallback(base_cmd_gpu, base_cmd_cpu, duration, title):
+    if HW_MODE == "gpu" and base_cmd_gpu:
+        rc, log = run_ffmpeg_sync(base_cmd_gpu, duration, title + " (GPU)")
+        if rc == 0:
+            return
+        fire_and_forget_http(f"⚠️ GPU fallback activated. Switching to CPU encoding...")
+    rc, log = run_ffmpeg_sync(base_cmd_cpu, duration, title + " (CPU)")
+    if rc != 0:
+        raise Exception("FFmpeg command crashed on execution.\n" + "\n".join(log[-8:]))
 
-    state = session.get("state")
-    text = m.text.strip().upper() if m.text else ""
-
-    if state == "WAIT_SUB":
-        if m.document and m.document.file_name and m.document.file_name.lower().endswith(('.srt', '.ass', '.vtt', '.txt')):
-            st_sub = await m.reply("⏳ **Securing Subtitle File...**")
-            try:
-                copied_sub = await m.copy(DESK_CHANNEL_ID)
-                session["sub_msg_id"] = str(copied_sub.id)
-                await st_sub.delete()
-            except Exception as e:
-                return await st_sub.edit(f"❌ Subtitle Copy Error: `{e}`")
-                
-            session["state"] = "WAIT_RENAME_CHOICE"
-            await m.reply("✏️ Video rename karna hai? Type `R` to Rename ya `S` for Same Name.")
-        elif text == "S":
-            session["sub_msg_id"] = "none"
-            session["state"] = "WAIT_RENAME_CHOICE"
-            await m.reply("✏️ Video rename karna hai? Type `R` to Rename ya `S` for Same Name.")
-        else:
-            await m.reply("❌ Invalid format! Sahi subtitle file (.srt, .ass, .vtt) bhejo ya `S` likh kar skip karo.")
-        return
-
-    if state == "WAIT_RENAME_CHOICE":
-        if text == "R":
-            session["state"] = "WAIT_RENAME_VALUE"
-            await m.reply("✍️ Naya file name bhejo (bina .mp4 lagaye):")
-        elif text == "S":
-            session["rename"] = session["orig_name"]
-            await prompt_watermark_or_execute(c, m, user_id, session)
-        else:
-            await m.reply("❌ Invalid! Type `R` to rename ya `S` to skip.")
-        return
-
-    elif state == "WAIT_RENAME_VALUE":
-        if not m.text:
-            return await m.reply("❌ Please send a valid text name.")
-        raw_name = m.text.strip().replace("/", "_").replace("\\", "_")
-        if raw_name.lower().endswith(".mp4"):
-            raw_name = raw_name[:-4]
-        session["rename"] = raw_name + ".mp4"
-        await prompt_watermark_or_execute(c, m, user_id, session)
-        return
-
-    elif state == "WAIT_WM_CHOICE":
-        if text == "A":
-            session["watermark"] = "yes"
-        elif text == "S":
-            session["watermark"] = "no"
-        else:
-            return await m.reply("❌ Invalid! Type `A` to add watermark ya `S` to skip.")
-        await execute_dispatch_hardsub(user_id, m)
-
-async def execute_dispatch_hardsub(user_id, msg: Message):
-    data = users_data.pop(user_id)
-    st = await msg.reply("⏳ **Task Registered!** Queue me insert kiya jaa raha hai...")
-
-    wm_msg_id = "none"
-    wm_pos = "right"
-    if data.get("watermark") == "yes":
-        wm_msg_id = await copy_pinned_file_to_desk(data["chat_id"], "watermark")
-        wm_pos = wm_positions.get(data["chat_id"], "right")
-
-    font_msg_id = await copy_pinned_file_to_desk(data["chat_id"], "file")
-
-    payload = {
-        "task_type": "hardsub",
-        "video_msg_id": data["video_msg_id"],
-        "sub_msg_id": data.get("sub_msg_id", "none"), 
-        "chat_id": str(data["chat_id"]), 
-        "user_id": str(user_id),
-        "resolution": "none", 
-        "wm_msg_id": wm_msg_id, 
-        "wm_pos": wm_pos, 
-        "rename": data.get("rename", "none"),
-        "font_msg_id": font_msg_id, 
-        "trigger_msg_id": str(st.id)
-    }
-    await enqueue_task(data["chat_id"], st.id, payload)
-
-# ── ABORT / CANCEL ACTION WORKER ─────────────────────────────────────
-@app.on_callback_query(filters.regex("cancel_active_run"))
-async def cancel_run_callback(c, q: CallbackQuery):
-    if q.from_user.id not in [OWNER_ID, ALLOWED_USER]:
-        return await q.answer("❌ Aap is task ko cancel nahi kar sakte.", show_alert=True)
-
+# ----------------------------- UPLOAD ENGINE -----------------------------
+async def deliver_video_asset(app_instance, chat_id, target_user, file_path, caption):
+    if not os.path.exists(file_path) or os.path.getsize(file_path) < 100:
+        raise Exception("Processed output file was empty or missing.")
+    thumb_path = "thumb.jpg"
     try:
-        cancelled = False
-        for tid, details in list(running_tasks.items()):
-            details["cancel"] = True
-            cancelled = True
+        subprocess.run(["ffmpeg", "-y", "-i", file_path, "-ss", "00:00:01", "-vframes", "1", thumb_path],
+                       capture_output=True, timeout=15)
+    except:
+        pass
+    if not os.path.exists(thumb_path):
+        thumb_path = None
 
-        if cancelled:
-            await q.message.edit("🛑 **Task Cancel Signal sent successfully!**")
-            await q.answer("Task Aborted", show_alert=True)
-        else:
-            await q.answer("Active status par koi task nahi mila.", show_alert=True)
-    except Exception as e:
-        await q.answer(f"Abort Exception: {e}", show_alert=True)
-
-@app.on_message(filters.command("kill"))
-async def kill_cmd(_, m: Message):
-    if not is_authorized(m):
-        return await m.reply_text("❌ Aap is command ke liye authorized nahi hain.")
-
-    if not KAG_ACCOUNTS:
-        return await m.reply_text("❌ Koi Kaggle account configured nahi hai.")
-
-    msg = await m.reply_text("🗑️ Saare active notebooks abort aur cache clean kar raha hoon...")
-
-    for tid in list(running_tasks.keys()):
-        running_tasks[tid]["cancel"] = True
-
-    deleted, errors = await asyncio.to_thread(kill_all_notebooks_verbose)
-
-    text = f"✅ `{len(deleted)}` Kaggle notebook(s) delete kiye gaye."
-    if deleted:
-        text += "\n" + "\n".join(f"• `{d}`" for d in deleted[:15])
-    if errors:
-        text += "\n\n⚠️ **Errors:**\n" + "\n".join(f"• {e}" for e in errors[:6])
-    await msg.edit_text(text)
-
-@app.on_message(filters.command("clean"))
-async def clean_cmd(_, m: Message):
-    if not is_authorized(m):
-        return
-    had = users_data.pop(m.from_user.id, None)
-    await m.reply_text("🔄 **Session refreshed.** Pichla /sub flow reset ho gaya." if had else "🔄 **Already clean.**")
-
-# ── SYSTEM STARTUP ───────────────────────────────────────────────────
-if __name__ == "__main__":
-    from pyrogram.errors import FloodWait
-
-    async def run_bot_safe():
+    reset_prog()
+    pm_msg, file_id = None, None
+    try:
+        pm_msg = await asyncio.wait_for(
+            app_instance.send_document(chat_id=target_user, document=file_path, caption=caption,
+                                       thumb=thumb_path, progress=prog, progress_args=("sending_video",)),
+            timeout=1800
+        )
+        if pm_msg and pm_msg.document:
+            file_id = pm_msg.document.file_id
+    except:
         try:
-            threading.Thread(target=run_web_server, daemon=True).start()
-            print("📡 Web server bound successfully.")
+            pm_msg = await asyncio.wait_for(
+                app_instance.send_document(chat_id=chat_id, document=file_path,
+                                           caption=f"⚠️ <a href='tg://user?id={target_user}'>User</a>, Video Ready:\n\n{caption}",
+                                           thumb=thumb_path, progress=prog, progress_args=("sending_video",),
+                                           parse_mode=ParseMode.HTML),
+                timeout=1800
+            )
+            if pm_msg and pm_msg.document:
+                file_id = pm_msg.document.file_id
+        except:
+            pass
 
-            ensure_kaggle_installed()
-            await app.start()
-            print(f"🚀 Controller Bot Connected (Prefix ID: {BOT_INSTANCE_HASH})!")
+    if file_id:
+        try:
+            await app_instance.send_document(chat_id=DESK_CHANNEL_ID, document=file_id,
+                                             caption=f"🎬 Logs: {caption}\nUser: `{target_user}`")
+        except:
+            pass
+    return pm_msg
 
-            deleted, _ = await asyncio.to_thread(kill_all_notebooks_verbose)
-            print(f"[startup] {len(deleted)} active kernels successfully aborted.")
+# ----------------------------- MAIN DRIVER -----------------------------
+async def main_driver():
+    global status_msg_id, app
 
-            for acc in KAG_ACCOUNTS:
-                asyncio.create_task(account_worker(acc))
-            print(f"[startup] {len(KAG_ACCOUNTS)} Account workers successfully initiated.")
+    app = Client("worker_down", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
+                 workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
+    await app.start()
+    try:
+        await app.get_chat(CHAT_ID)
+    except:
+        pass
 
-            await pyrogram.idle()
-            await app.stop()
-            
-        except FloodWait as e:
-            print(f"⚠️ Telegram FloodWait triggered! Sleeping for {e.value} seconds to clear rate limit.")
-            await asyncio.sleep(e.value + 10)
+    status_msg_id = int(TRIGGER_MSG_ID) if TRIGGER_MSG_ID else None
+    if not status_msg_id:
+        init_msg = await app.send_message(CHAT_ID, "⚙️ Worker running...")
+        status_msg_id = init_msg.id
+
+    step_dl = "hardsub_download" if TASK_TYPE == "hardsub" else "compress_download"
+    video_file = await download_asset_robust(app, VIDEO_MSG_ID, os.path.join(WORK_DIR, "video.mkv"), step_dl)
+    if not video_file:
+        raise Exception("Telegram video download failed.")
+
+    duration = get_duration(video_file)
+
+    base_name = "output"
+    if RENAME and RENAME != "none":
+        base_name = RENAME.rsplit('.', 1)[0]
+    out_name = os.path.join(WORK_DIR, f"{base_name}.mp4")
+
+    font_name = "Arial"
+    if FONT_MSG_ID and FONT_MSG_ID != "none":
+        fonts_dir = os.path.join(WORK_DIR, "fonts")
+        os.makedirs(fonts_dir, exist_ok=True)
+        font_path = await download_asset_robust(app, FONT_MSG_ID, os.path.join(fonts_dir, "custom_font.ttf"), step_dl)
+        if font_path and os.path.exists(font_path):
+            font_name = get_font_name(font_path)
+
+    sub_file, wm_file, has_watermark = None, None, False
+    extracted_subs = []
+
+    if TASK_TYPE == "hardsub":
+        if SUB_MSG_ID and SUB_MSG_ID != "none":
+            sub_file = await download_asset_robust(app, SUB_MSG_ID, os.path.join(WORK_DIR, "sub_raw"), "hardsub_download")
+        if not sub_file or not os.path.exists(sub_file):
+            raise Exception("Subtitles download failed.")
+        ready_sub_path = os.path.join(WORK_DIR, "ready_sub.ass")
+        if sub_file.lower().endswith('.ass') or is_ass_format(sub_file):
             try:
-                print("🔄 Attempting startup after waiting out the rate limit...")
-                await app.start()
-                print("✅ Bot successfully started after recovery!")
-                for acc in KAG_ACCOUNTS:
-                    asyncio.create_task(account_worker(acc))
-                await pyrogram.idle()
-            except Exception as retry_err:
-                print(f"❌ Failed to start bot after recovery attempt: {retry_err}")
-                sys.exit(1)
-        except Exception as startup_err:
-            print(f"❌ Critical error on startup: {startup_err}")
-            sys.exit(1)
+                with open(sub_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    ass_content = f.read()
+            except:
+                with open(sub_file, 'r', encoding='latin-1', errors='ignore') as f:
+                    ass_content = f.read()
+            if any(word in ass_content.lower() for word in ["logo", "watermark", "cr", "credit"]):
+                has_watermark = True
+            if FONT_MSG_ID and FONT_MSG_ID != "none":
+                lines = ass_content.splitlines()
+                new_lines = []
+                for line in lines:
+                    if line.strip().startswith("Style:"):
+                        parts = line.split(",", 2)
+                        if len(parts) >= 3:
+                            line = f"{parts[0]},{font_name},{parts[2]}"
+                    new_lines.append(line)
+                with open(ready_sub_path, "w", encoding='utf-8') as f:
+                    f.write("\n".join(new_lines))
+            else:
+                shutil.copy(sub_file, ready_sub_path)
+        else:
+            try:
+                subs = pysubs2.load(sub_file, encoding='utf-8')
+            except:
+                subs = pysubs2.load(sub_file, encoding='latin-1')
+            new_subs = pysubs2.SSAFile()
+            new_subs.styles["Default"] = pysubs2.SSAStyle(fontname=font_name, fontsize=24,
+                primarycolor=pysubs2.Color(255, 255, 255), outlinecolor=pysubs2.Color(0, 0, 0),
+                outline=2, shadow=1, marginl=20, marginr=20, marginv=15)
+            for line in subs:
+                clean_text = re.sub(r'<[^>]+>', '', re.sub(r'\{[^}]+\}', '', line.text)).replace('\r', '').replace('\n', '\\N').strip()
+                if clean_text:
+                    new_subs.append(pysubs2.SSAEvent(start=line.start, end=line.end, text=clean_text, style="Default"))
+            new_subs.save(ready_sub_path)
+
+        if WM_MSG_ID and WM_MSG_ID != "none" and not has_watermark:
+            wm_file = await download_asset_robust(app, WM_MSG_ID, os.path.join(WORK_DIR, "watermark.png"), "hardsub_download")
+
+    await app.stop()
+
+    process_title = "Compressing" if TASK_TYPE == "compress" else "Encoding Hardsub"
+
+    if TASK_TYPE == "compress":
+        await update_http_status("⚙️ Checking and extracting subtitles from container...")
+        cmd_probe = ["ffprobe", "-v", "error", "-select_streams", "s",
+                     "-show_entries", "stream=index,codec_name", "-of", "csv=p=0", video_file]
+        res_probe = subprocess.run(cmd_probe, capture_output=True, text=True)
+        if res_probe.stdout.strip():
+            streams = res_probe.stdout.strip().split('\n')
+            for i, st in enumerate(streams):
+                if not st: continue
+                parts = st.split(',')
+                s_idx = parts[0]
+                s_codec = parts[1].strip()
+                if s_codec in ['ass', 'ssa']:
+                    ass_out = os.path.join(WORK_DIR, f"{base_name}_track_{i+1}.ass")
+                    subprocess.run(["ffmpeg", "-y", "-i", video_file, "-map", f"0:{s_idx}", ass_out])
+                    if os.path.exists(ass_out) and os.path.getsize(ass_out) > 0:
+                        extracted_subs.append(ass_out)
+                elif s_codec in ['subrip', 'srt', 'webvtt']:
+                    temp_ext = ".srt" if s_codec == 'subrip' else ".vtt"
+                    temp_sub = os.path.join(WORK_DIR, f"temp_{i+1}{temp_ext}")
+                    subprocess.run(["ffmpeg", "-y", "-i", video_file, "-map", f"0:{s_idx}", temp_sub])
+                    if os.path.exists(temp_sub) and os.path.getsize(temp_sub) > 0:
+                        ass_out = os.path.join(WORK_DIR, f"{base_name}_track_{i+1}.ass")
+                        convert_to_clean_ass(temp_sub, ass_out)
+                        if os.path.exists(ass_out):
+                            extracted_subs.append(ass_out)
+
+        reso_clean = str(RESOLUTION).replace("p", "").replace("P", "").strip() if RESOLUTION else ""
+        scale_filter = f"scale=-2:{reso_clean}" if reso_clean and reso_clean.lower() != "none" else "scale='trunc(iw/2)*2:trunc(ih/2)*2'"
+
+        await update_http_status(f"⚙️ {process_title}\n{get_process_bar(0)} [0.0%]")
+
+        # FIX 1: CRF 34 for compression
+        cmd_cpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", scale_filter,
+                   "-map", "0:v", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
+                   "-crf", "34", "-pix_fmt", "yuv420p", "-threads", "0", "-c:a", "aac", "-b:a", "128k",
+                   "-movflags", "+faststart", out_name]
+        cmd_gpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", scale_filter,
+                   "-map", "0:v", "-map", "0:a?", "-c:v", "h264_nvenc", "-preset", "p4",
+                   "-cq", "34", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                   "-movflags", "+faststart", out_name]
+
+        await asyncio.to_thread(encode_with_fallback, cmd_gpu, cmd_cpu, duration, process_title)
+
+    elif TASK_TYPE == "hardsub":
+        vf_filter = "subtitles='ready_sub.ass':charenc=UTF-8"
+        if FONT_MSG_ID and FONT_MSG_ID != "none":
+            vf_filter += ":fontsdir=fonts"
+        v_filter = f"scale='trunc(iw/2)*2:trunc(ih/2)*2',{vf_filter}"
+        overlay_coord = "W-w-15:15" if WM_POS == "right" else "15:15"
+
+        await update_http_status(f"⚙️ {process_title}\n{get_process_bar(0)} [0.0%]")
+
+        if wm_file and os.path.exists(wm_file):
+            complex_f = f"[0:v]{v_filter}[vsub];[1:v]scale=200:-1[wm];[vsub][wm]overlay={overlay_coord}"
+            cmd_cpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-i", wm_file,
+                       "-filter_complex", complex_f, "-c:v", "libx264", "-preset", "ultrafast",
+                       "-crf", "26", "-pix_fmt", "yuv420p", "-threads", "0", "-c:a", "aac",
+                       "-movflags", "+faststart", out_name]
+            cmd_gpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-i", wm_file,
+                       "-filter_complex", complex_f, "-c:v", "h264_nvenc", "-preset", "p4",
+                       "-cq", "26", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                       "-movflags", "+faststart", out_name]
+        else:
+            cmd_cpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", v_filter,
+                       "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", "-pix_fmt", "yuv420p",
+                       "-threads", "0", "-c:a", "aac", "-movflags", "+faststart", out_name]
+            cmd_gpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", v_filter,
+                       "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "26", "-pix_fmt", "yuv420p",
+                       "-c:a", "aac", "-movflags", "+faststart", out_name]
+
+        await asyncio.to_thread(encode_with_fallback, cmd_gpu, cmd_cpu, duration, process_title)
+
+    # --- UPLOAD ---
+    app = Client("worker_up", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
+                 workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
+    await app.start()
+    try:
+        await app.get_chat(CHAT_ID)
+    except:
+        pass
+
+    await update_http_status(f"📤 Sending Video\n{get_send_bar(0)} [0.0%]")
+    # FIX 2: caption only file name, no extra text
+    caption = os.path.basename(out_name)
+    await deliver_video_asset(app, CHAT_ID, USER_ID, out_name, caption)
+
+    if TASK_TYPE == "compress" and extracted_subs:
+        for sub_f in extracted_subs:
+            try:
+                await app.send_document(chat_id=USER_ID, document=sub_f, caption="📄 Extracted Clean Subtitles (.ass)")
+            except:
+                try:
+                    await app.send_document(chat_id=CHAT_ID, document=sub_f, caption="📄 Extracted Clean Subtitles (.ass)")
+                except:
+                    pass
 
     try:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(run_bot_safe())
-    except (KeyboardInterrupt, SystemExit):
-        print("🔌 Bot execution terminated cleanly.")
-    except Exception as e:
-        print(f"🚨 Fatal exception in main execution loop: {e}")
+        await app.delete_messages(CHAT_ID, status_msg_id)
+    except:
+        pass
+    await app.stop()
+    # FIX 3: ensure Kaggle kernel exits
+    sys.exit(0)
+
+async def update_http_status(text):
+    fire_and_forget_http(text)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_driver())
+    except Exception as outer_err:
+        tb_data = traceback.format_exc()
+        report_critical_failure(tb_data)
+        sys.exit(1)
