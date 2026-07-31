@@ -2,24 +2,19 @@ import os, sys, site, importlib, importlib.util, importlib.metadata, traceback
 import time, asyncio, subprocess, json, gc, re, base64, requests, html, shutil, threading
 
 # ----------------------------- EARLY PATH SETUP -----------------------------
-# Add user site-packages (where --user packages get installed) to sys.path
-user_site = site.getusersitepackages()
-if os.path.exists(user_site) and user_site not in sys.path:
-    sys.path.insert(0, user_site)
+def _ensure_user_site_path():
+    user_site = site.getusersitepackages()
+    if os.path.exists(user_site) and user_site not in sys.path:
+        sys.path.insert(0, user_site)
 
-# Also add standard site-packages just in case
-for sp in site.getsitepackages():
-    if os.path.exists(sp) and sp not in sys.path:
-        sys.path.append(sp)
-
-importlib.invalidate_caches()
+_ensure_user_site_path()
 # -----------------------------------------------------------------------------
 
 WORK_DIR = "/kaggle/working" if os.path.exists("/kaggle") else "/tmp/kavvle_work"
 os.makedirs(WORK_DIR, exist_ok=True)
 os.chdir(WORK_DIR)
 
-# Globals for progress
+# Globals
 last_time = 0
 start_time = 0
 status_msg_id = None
@@ -76,7 +71,7 @@ except Exception:
     report_critical_failure(tb)
     sys.exit(1)
 
-# ----------------------------- DEPENDENCY SYSTEM (Deep Angeline style) -----------------------------
+# ----------------------------- DEPENDENCY SYSTEM (with path fix) -----------------------------
 def ensure_deps():
     need = []
     for mod, pip_name in [("pyrogram", "pyrogram"), ("tgcrypto", "tgcrypto"),
@@ -85,12 +80,13 @@ def ensure_deps():
             need.append(pip_name)
     if need:
         print(f"📦 Installing missing packages: {need}")
-        # Always use --user to work on Kaggle's read-only system
         cmd = [sys.executable, "-m", "pip", "install", "-q", "--user", "--no-cache-dir", *need]
         try:
             subprocess.run(cmd, check=True)
         except Exception:
-            subprocess.run(cmd, check=False)  # fallback if user site fails
+            subprocess.run(cmd, check=False)
+        # Crucial: after install, add user site-packages to path again
+        _ensure_user_site_path()
         importlib.invalidate_caches()
 
 ensure_deps()
@@ -124,7 +120,6 @@ def get_send_bar(percent):
     return f"[{'▓' * filled}{'▒' * (20 - filled)}]"
 
 async def prog(current, total, step_name):
-    """Called by Pyrogram during download/upload. Fast: uses Pyrogram edit."""
     global last_time, start_time, app
     now = time.time()
     if start_time == 0:
@@ -146,7 +141,6 @@ async def prog(current, total, step_name):
             pass
         last_time = now
 
-# Progress for encoding (non‑blocking HTTP)
 def _sync_http_edit(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     payload = {"chat_id": CHAT_ID, "message_id": status_msg_id, "text": text, "parse_mode": "HTML",
@@ -157,7 +151,6 @@ def _sync_http_edit(text):
         pass
 
 def fire_and_forget_http(text):
-    """Non‑blocking status update (used during encoding to avoid stalling FFmpeg)"""
     threading.Thread(target=_sync_http_edit, args=(text,), daemon=True).start()
 
 # ----------------------------- UTILITY FUNCTIONS -----------------------------
@@ -201,7 +194,7 @@ def convert_to_clean_ass(input_sub, output_ass):
     except:
         pass
 
-# ----------------------------- DOWNLOAD ENGINE (Pyrogram - Fast) -----------------------------
+# ----------------------------- DOWNLOAD ENGINE -----------------------------
 async def download_message_asset(app_instance, msg_id_str, output_path, step_name):
     if not msg_id_str or msg_id_str == "none":
         return None
@@ -246,7 +239,7 @@ async def download_asset_robust(app_instance, val, output_path, step_name):
         return await download_message_asset(app_instance, val, output_path, step_name)
     return await download_by_file_id(app_instance, val, output_path, step_name)
 
-# ----------------------------- ENCODING ENGINE (FFmpeg with fallback) -----------------------------
+# ----------------------------- ENCODING ENGINE -----------------------------
 def run_ffmpeg_sync(cmd, duration, process_title):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     last_edit = time.time()
@@ -265,7 +258,6 @@ def run_ffmpeg_sync(cmd, duration, process_title):
                 try:
                     us = int(line.split("=")[1])
                     percent = min((us / 1_000_000.0 / duration) * 100, 100.0)
-                    # Non‑blocking fire‑and‑forget status update
                     fire_and_forget_http(f"⚙️ {process_title}\n{get_process_bar(percent)} [{percent:.1f}%]")
                 except:
                     pass
@@ -283,7 +275,7 @@ def encode_with_fallback(base_cmd_gpu, base_cmd_cpu, duration, title):
     if rc != 0:
         raise Exception("FFmpeg command crashed on execution.\n" + "\n".join(log[-8:]))
 
-# ----------------------------- UPLOAD ENGINE (Pyrogram - Fast) -----------------------------
+# ----------------------------- UPLOAD ENGINE -----------------------------
 async def deliver_video_asset(app_instance, chat_id, target_user, file_path, caption):
     if not os.path.exists(file_path) or os.path.getsize(file_path) < 100:
         raise Exception("Processed output file was empty or missing.")
