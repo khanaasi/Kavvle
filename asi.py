@@ -527,27 +527,29 @@ async def main_driver():
         fire_and_forget_http(f"⚙️ <b>{process_title}</b>\n{get_process_bar(0)} [0.0%]")
 
         if wm_file and os.path.exists(wm_file):
-            complex_f = f"[0:v]{v_filter}[vsub];[1:v]scale=-1:min(ih*0.08\\,80)[wm];[vsub][wm]overlay={overlay_coord}:format=yuv420p"
+            complex_f = f"[0:v]{v_filter}[vsub];[1:v]scale=-1:min(ih*0.08\\,80)[wm];[vsub][wm]overlay={overlay_coord}:format=yuv420p[vout]"
             
+            # Yahan Galti thi - [vout] add karna zaroori hai map ke aage varna video gayab ho jayegi
             cmd_cpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-i", wm_file,
-                       "-filter_complex", complex_f, "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
-                       "-crf", "28", "-maxrate", max_rate, "-bufsize", buf_size, "-threads", "0", "-c:a", "aac",
+                       "-filter_complex", complex_f, "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
+                       "-crf", "28", "-maxrate", max_rate, "-bufsize", buf_size, "-threads", "0", "-c:a", "aac", "-b:a", "128k",
                        "-movflags", "+faststart", out_name]
                        
             cmd_gpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-i", wm_file,
-                       "-filter_complex", complex_f, "-map", "0:a?", "-c:v", "h264_nvenc", "-preset", "p4",
-                       "-cq", "28", "-maxrate", max_rate, "-bufsize", buf_size, "-c:a", "aac",
+                       "-filter_complex", complex_f, "-map", "[vout]", "-map", "0:a?", "-c:v", "h264_nvenc", "-preset", "p4",
+                       "-cq", "28", "-maxrate", max_rate, "-bufsize", buf_size, "-c:a", "aac", "-b:a", "128k",
                        "-movflags", "+faststart", out_name]
         else:
+            # Yahan -map 0:v missing tha jab maine -map 0:a? lagaya. Ab ekdum fix hai.
             cmd_cpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", v_filter,
-                       "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                       "-map", "0:v", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                        "-maxrate", max_rate, "-bufsize", buf_size, "-pix_fmt", "yuv420p",
-                       "-threads", "0", "-c:a", "aac", "-movflags", "+faststart", out_name]
+                       "-threads", "0", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_name]
                        
             cmd_gpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", v_filter,
-                       "-map", "0:a?", "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "28",
+                       "-map", "0:v", "-map", "0:a?", "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "28",
                        "-maxrate", max_rate, "-bufsize", buf_size, "-pix_fmt", "yuv420p",
-                       "-c:a", "aac", "-movflags", "+faststart", out_name]
+                       "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_name]
 
         await asyncio.to_thread(encode_with_fallback, cmd_gpu, cmd_cpu, duration, process_title)
 
