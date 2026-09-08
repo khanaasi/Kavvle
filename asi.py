@@ -14,9 +14,9 @@ WORK_DIR = "/kaggle/working" if os.path.exists("/kaggle") else "/tmp/kavvle_work
 os.makedirs(WORK_DIR, exist_ok=True)
 os.chdir(WORK_DIR)
 
-# Auto Install GPU-Accelerated FFmpeg on Kaggle environment
-if shutil.which("ffmpeg") is None or "nvenc" not in subprocess.run("ffmpeg -encoders 2>/dev/null", shell=True, capture_output=True, text=True).stdout:
-    subprocess.run("conda install -y -c conda-forge ffmpeg || apt-get update && apt-get install -y ffmpeg", shell=True)
+# Auto Install FFmpeg on Kaggle environment
+if shutil.which("ffmpeg") is None:
+    subprocess.run("apt-get update && apt-get install -y ffmpeg", shell=True)
 
 # Globals
 last_time = 0
@@ -135,7 +135,7 @@ def _sync_http_edit(text):
 def fire_and_forget_http(text):
     threading.Thread(target=_sync_http_edit, args=(text,), daemon=True).start()
 
-# --- FLOODWAIT PROOF PROGRESS CALLBACK (Strict 12s Interval) ---
+# --- FLOODWAIT PROOF PROGRESS CALLBACK ---
 def prog(current, total, step_name):
     global last_time, start_time
     now = time.time()
@@ -303,7 +303,7 @@ def run_ffmpeg_sync(cmd, duration, process_title):
                 log_tail.pop(0)
         if "out_time_us=" in line and duration > 0:
             now = time.time()
-            if now - last_edit >= 12:  # Strict 12s interval
+            if now - last_edit >= 12:
                 try:
                     us = int(line.split("=")[1])
                     percent = min((us / 1_000_000.0 / duration) * 100, 100.0)
@@ -319,9 +319,7 @@ def encode_with_fallback(base_cmd_gpu, base_cmd_cpu, duration, title):
         rc, log = run_ffmpeg_sync(base_cmd_gpu, duration, title + " (GPU)")
         if rc == 0:
             return
-        err_msg = "\n".join(log[-3:])
-        fire_and_forget_http(f"⚠️ <b>GPU failed. Switching to CPU...</b>\nError: <code>{html.escape(err_msg)}</code>")
-        
+        fire_and_forget_http(f"⚠️ GPU fallback activated. Switching to CPU encoding...")
     rc, log = run_ffmpeg_sync(base_cmd_cpu, duration, title + " (CPU)")
     if rc != 0:
         raise Exception("FFmpeg command crashed on execution.\n" + "\n".join(log[-8:]))
@@ -468,14 +466,21 @@ async def main_driver():
 
     process_title = "Compressing" if TASK_TYPE == "compress" else "Encoding Hardsub"
     
-    reso_clean = str(RESOLUTION).replace("p", "").replace("P", "").strip() if RESOLUTION and str(RESOLUTION).lower() != "none" else ""
+    reso_clean = str(RESOLUTION).replace("p", "").replace("P", "").strip() if RESOLUTION else ""
     
-    # Smart Quality/Size Engine
-    crf_val = "28" if TASK_TYPE == "compress" else "23" 
-    if reso_clean == "1080": max_rate, buf_size = "2500k", "3500k"
-    elif reso_clean == "720": max_rate, buf_size = "1200k", "1800k"
-    elif reso_clean == "480": max_rate, buf_size = "700k", "1000k"
-    else: max_rate, buf_size = "0", "0" 
+    # [Yahan Quality Fix ki gayi hai taaki video fate nahi]
+    if TASK_TYPE == "hardsub":
+        crf_val = "23" # Hardsub ke liye best CRF quality
+        if reso_clean == "1080": max_rate, buf_size = "3000k", "4000k"
+        elif reso_clean == "720": max_rate, buf_size = "1500k", "2000k"
+        elif reso_clean == "480": max_rate, buf_size = "800k", "1200k"
+        else: max_rate, buf_size = "2500k", "3500k"
+    else:
+        crf_val = "28" # Compress ke liye original CRF
+        if reso_clean == "1080": max_rate, buf_size = "1400k", "2000k"
+        elif reso_clean == "720": max_rate, buf_size = "850k", "1300k"
+        elif reso_clean == "480": max_rate, buf_size = "500k", "800k"
+        else: max_rate, buf_size = "1200k", "1800k"
 
     if TASK_TYPE == "compress":
         fire_and_forget_http("⚙️ <b>Checking and extracting subtitles from container...</b>")
@@ -504,21 +509,19 @@ async def main_driver():
                         if os.path.exists(ass_out):
                             extracted_subs.append(ass_out)
 
-        scale_filter = f"scale=-2:min({reso_clean}\\,ih)" if reso_clean else "scale='trunc(iw/2)*2:trunc(ih/2)*2'"
+        scale_filter = f"scale=-2:min({reso_clean}\\,ih)" if reso_clean and reso_clean.lower() != "none" else "scale='trunc(iw/2)*2:trunc(ih/2)*2'"
 
         fire_and_forget_http(f"⚙️ <b>{process_title}</b>\n{get_process_bar(0)} [0.0%]")
 
         cmd_cpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", scale_filter,
-                   "-map", "0:v", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
-                   "-crf", crf_val, "-pix_fmt", "yuv420p", "-threads", "0", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
-        if max_rate != "0": cmd_cpu.extend(["-maxrate", max_rate, "-bufsize", buf_size])
-        cmd_cpu.append(out_name)
+                   "-map", "0:v", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
+                   "-crf", crf_val, "-maxrate", max_rate, "-bufsize", buf_size, "-pix_fmt", "yuv420p",
+                   "-threads", "0", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_name]
         
-        cmd_gpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-hwaccel", "auto", "-i", video_file, "-vf", scale_filter,
-                   "-map", "0:v", "-map", "0:a?", "-c:v", "h264_nvenc", "-preset", "fast",
-                   "-cq", crf_val, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
-        if max_rate != "0": cmd_gpu.extend(["-maxrate", max_rate, "-bufsize", buf_size])
-        cmd_gpu.append(out_name)
+        cmd_gpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", scale_filter,
+                   "-map", "0:v", "-map", "0:a?", "-c:v", "h264_nvenc", "-preset", "p4",
+                   "-cq", crf_val, "-maxrate", max_rate, "-bufsize", buf_size, "-pix_fmt", "yuv420p",
+                   "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_name]
 
         await asyncio.to_thread(encode_with_fallback, cmd_gpu, cmd_cpu, duration, process_title)
 
@@ -527,7 +530,7 @@ async def main_driver():
         if FONT_MSG_ID and FONT_MSG_ID != "none":
             vf_filter += ":fontsdir=fonts"
             
-        scale_filter = f"scale=-2:min({reso_clean}\\,ih)" if reso_clean else "scale='trunc(iw/2)*2:trunc(ih/2)*2'"
+        scale_filter = f"scale=-2:min({reso_clean}\\,ih)" if reso_clean and reso_clean.lower() != "none" else "scale='trunc(iw/2)*2:trunc(ih/2)*2'"
         v_filter = f"{scale_filter},{vf_filter}"
         overlay_coord = "W-w-15:15" if WM_POS == "right" else "15:15"
 
@@ -537,28 +540,24 @@ async def main_driver():
             complex_f = f"[0:v]{v_filter}[vsub];[1:v]scale=-1:min(ih*0.08\\,80)[wm];[vsub][wm]overlay={overlay_coord}:format=yuv420p[vout]"
             
             cmd_cpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-i", wm_file,
-                       "-filter_complex", complex_f, "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
-                       "-crf", crf_val, "-threads", "0", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
-            if max_rate != "0": cmd_cpu.extend(["-maxrate", max_rate, "-bufsize", buf_size])
-            cmd_cpu.append(out_name)
+                       "-filter_complex", complex_f, "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
+                       "-crf", crf_val, "-maxrate", max_rate, "-bufsize", buf_size, "-threads", "0", "-c:a", "aac", "-b:a", "128k",
+                       "-movflags", "+faststart", out_name]
                        
-            cmd_gpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-hwaccel", "auto", "-i", video_file, "-i", wm_file,
-                       "-filter_complex", complex_f, "-map", "[vout]", "-map", "0:a?", "-c:v", "h264_nvenc", "-preset", "fast",
-                       "-cq", crf_val, "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
-            if max_rate != "0": cmd_gpu.extend(["-maxrate", max_rate, "-bufsize", buf_size])
-            cmd_gpu.append(out_name)
+            cmd_gpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-i", wm_file,
+                       "-filter_complex", complex_f, "-map", "[vout]", "-map", "0:a?", "-c:v", "h264_nvenc", "-preset", "p4",
+                       "-cq", crf_val, "-maxrate", max_rate, "-bufsize", buf_size, "-c:a", "aac", "-b:a", "128k",
+                       "-movflags", "+faststart", out_name]
         else:
             cmd_cpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", v_filter,
-                       "-map", "0:v", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", crf_val,
-                       "-pix_fmt", "yuv420p", "-threads", "0", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
-            if max_rate != "0": cmd_cpu.extend(["-maxrate", max_rate, "-bufsize", buf_size])
-            cmd_cpu.append(out_name)
+                       "-map", "0:v", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast", "-crf", crf_val,
+                       "-maxrate", max_rate, "-bufsize", buf_size, "-pix_fmt", "yuv420p",
+                       "-threads", "0", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_name]
                        
-            cmd_gpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-hwaccel", "auto", "-i", video_file, "-vf", v_filter,
-                       "-map", "0:v", "-map", "0:a?", "-c:v", "h264_nvenc", "-preset", "fast", "-cq", crf_val,
-                       "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
-            if max_rate != "0": cmd_gpu.extend(["-maxrate", max_rate, "-bufsize", buf_size])
-            cmd_gpu.append(out_name)
+            cmd_gpu = ["ffmpeg", "-y", "-progress", "pipe:1", "-i", video_file, "-vf", v_filter,
+                       "-map", "0:v", "-map", "0:a?", "-c:v", "h264_nvenc", "-preset", "p4", "-cq", crf_val,
+                       "-maxrate", max_rate, "-bufsize", buf_size, "-pix_fmt", "yuv420p",
+                       "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_name]
 
         await asyncio.to_thread(encode_with_fallback, cmd_gpu, cmd_cpu, duration, process_title)
 
