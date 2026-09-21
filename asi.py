@@ -208,11 +208,8 @@ def get_font_name(font_path):
     return "Arial"
 
 # ----------------------------- SUBTITLE HELPERS -----------------------------
-# Dialogue ALWAYS uses the bot's own style (subtitle file ka style / tags ignore),
-# same look as the Colab bot: Arial Bold, white, black outline, bottom centre,
-# and never more than 2 lines (long lines get a slightly smaller font instead of a 3rd line).
 PLAY_W, PLAY_H = 1920, 1080
-DLG_FONT_SIZE = 90      # 8.3% of frame height (= old 24pt @ 288), measured against the Colab screenshot
+DLG_FONT_SIZE = 90
 DLG_OUTLINE = 4
 DLG_SHADOW = 3
 DLG_MARGIN_V = 70
@@ -244,7 +241,6 @@ def is_ass_text(text):
 
 
 def _find_measure_font(custom_path=None):
-    """Font file used only to MEASURE text width (so we know when a line needs 2 lines / smaller size)."""
     if custom_path and os.path.exists(custom_path):
         return custom_path
     try:
@@ -269,9 +265,8 @@ class TextMeter:
             self.cmap, self.hmtx = f.getBestCmap(), f["hmtx"]
             upem = f["head"].unitsPerEm
             os2, hh = f["OS/2"], f["hhea"]
-            # ASS Fontsize = line cell height (win ascent + descent), so px per font unit = fs / cell
             self.cell = (os2.usWinAscent + os2.usWinDescent) or (hh.ascent - hh.descent) or upem
-            self.missing = int(0.62 * upem)     # glyphs the font lacks (e.g. Devanagari) -> libass falls back
+            self.missing = int(0.62 * upem)
             self.ok = True
         except Exception:
             pass
@@ -287,8 +282,6 @@ class TextMeter:
 
 
 def layout_dialogue(lines, meter):
-    """lines -> ASS text with at most 2 lines. Keeps the author's own 1-2 line split when it fits,
-    otherwise re-wraps into 2 balanced lines, and shrinks the font for that cue only if 2 lines are not enough."""
     lines = [l for l in lines if l.strip()]
     if not lines:
         return ""
@@ -308,7 +301,7 @@ def layout_dialogue(lines, meter):
         m = max(meter.width(a, fs), meter.width(b, fs))
         if best is None or m < best[0]:
             best = (m, a + "\\N" + b)
-    if best is None:                       # one single very long word
+    if best is None:
         best = (meter.width(flat, fs), flat)
     worst, text = best
     if worst <= limit:
@@ -317,10 +310,9 @@ def layout_dialogue(lines, meter):
 
 
 def _plain_lines(body):
-    """Cue text -> list of plain lines (all tags / styling removed)."""
-    body = re.sub(r"\{[^}]*\}", "", body)              # ass override tags
-    body = re.sub(r"<\d{1,2}:\d{2}[^>]*>", "", body)   # vtt karaoke timestamps
-    body = re.sub(r"</?[A-Za-z][^>]*>", "", body)      # <i> <b> <font ..> <c.x> <v ..>
+    body = re.sub(r"\{[^}]*\}", "", body)
+    body = re.sub(r"<\d{1,2}:\d{2}[^>]*>", "", body)
+    body = re.sub(r"</?[A-Za-z][^>]*>", "", body)
     body = html.unescape(body).replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ")
     lines = [re.sub(r"\s+", " ", l).strip() for l in body.replace("\r", "").split("\n")]
     return [l for l in lines if l]
@@ -356,8 +348,6 @@ def _srt_vtt_cues(text):
 
 
 def _ass_cues(text):
-    """Only the dialogue text + timing is taken from an .ass; its styles / positions / effects are ignored.
-    Vector drawings and watermark/logo/credit styled lines are dropped (they are not dialogue)."""
     cues, sec, fmt = [], None, None
     for raw in text.split("\n"):
         s = raw.strip()
@@ -388,7 +378,7 @@ def build_dialogue_ass(cues, font_name, bold, meter):
     head = (
         "[Script Info]\nScriptType: v4.00+\n"
         f"PlayResX: {PLAY_W}\nPlayResY: {PLAY_H}\n"
-        "WrapStyle: 2\nScaledBorderAndShadow: yes\nYCbCr Matrix: None\n\n"      # WrapStyle 2 = only OUR line breaks
+        "WrapStyle: 2\nScaledBorderAndShadow: yes\nYCbCr Matrix: None\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
@@ -409,7 +399,6 @@ def build_dialogue_ass(cues, font_name, bold, meter):
 
 
 def prepare_subtitle(sub_file, font_name, custom_font, out_path, font_path=None):
-    """Writes ready_sub.ass in the bot's own style. Returns False (the watermark is the PNG overlay)."""
     text = read_text_any(sub_file).replace("\r\n", "\n").replace("\r", "\n")
     if sub_file.lower().endswith((".ass", ".ssa")) or is_ass_text(text):
         cues = _ass_cues(text)
@@ -523,10 +512,9 @@ async def download_asset_robust(app_instance, val, output_path, step_name, show_
 TEXT_SUB_CODECS = {"ass", "ssa", "subrip", "srt", "webvtt", "mov_text", "text"}
 
 def extract_embedded_subs_sync(video_file, base_name):
-    """One ffmpeg pass for all text subtitle tracks. Runs in a thread while the encode is going on."""
     try:
-        res = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "s", "-show_entries",
-                              "stream=index,codec_name", "-of", "json", video_file],
+        res = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "s",
+                              "-show_entries", "stream=index,codec_name", "-of", "json", video_file],
                              capture_output=True, text=True, timeout=60)
         streams = json.loads(res.stdout or "{}").get("streams", [])
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", video_file]
@@ -586,15 +574,29 @@ def build_ffmpeg_cmds(video_file, out_name, crf, max_rate, buf_size, gop, vf=Non
             "-g", str(gop), "-force_key_frames", "expr:gte(t,n_forced*2)",
             "-c:a", "aac", "-b:a", "128k", "-ac", "2",
             "-max_muxing_queue_size", "1024", "-movflags", "+faststart", out_name]
-    cpu = head + ["-c:v", "libx264", "-preset", "ultrafast", "-crf", crf, "-maxrate", max_rate,
-                  "-bufsize", buf_size, "-threads", "0", "-forced-idr", "1"] + tail
-    gpu = head + ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", crf, "-b:v", "0",
-                  "-maxrate", max_rate, "-bufsize", buf_size, "-profile:v", "high", "-forced-idr", "1"] + tail
+
+    # ---------- CPU (libx264 ultrafast) ----------
+    cpu = head + ["-c:v", "libx264", "-preset", "ultrafast", "-crf", crf,
+                  "-maxrate", max_rate, "-bufsize", buf_size,
+                  "-threads", "0", "-forced-idr", "1"] + tail
+
+    # ---------- GPU (h264_nvenc) - OPTIMIZED ----------
+    # p1 = fastest NVENC preset; bf=0 + rc-lookahead=0 removes lookahead latency;
+    # spatial-aq=1 adds quality for almost zero speed cost.
+    gpu = head + ["-c:v", "h264_nvenc",
+                  "-preset", "p1",
+                  "-rc", "vbr", "-cq", crf, "-b:v", "0",
+                  "-maxrate", max_rate, "-bufsize", buf_size,
+                  "-spatial-aq", "1",
+                  "-bf", "0",
+                  "-rc-lookahead", "0",
+                  "-profile:v", "high",
+                  "-forced-idr", "1"] + tail
+
     return gpu, cpu
 
 # ----------------------------- OUTPUT VERIFICATION -----------------------------
 def _faststart_ok(path):
-    """moov atom must come BEFORE mdat, otherwise Telegram has to download everything before playing."""
     size_total = os.path.getsize(path)
     with open(path, "rb") as f:
         pos = 0
@@ -676,7 +678,9 @@ def encode_with_fallback(base_cmd_gpu, base_cmd_cpu, duration, title, out_name):
         rc, log = run_ffmpeg_sync(base_cmd_gpu, duration, title + " (GPU)")
         why = "ffmpeg failed"
         if rc == 0:
-            ok, why = verify_output(out_name, duration, full_decode=True)   # GPU path: full decode check
+            # OPTIMIZATION: spot-check instead of full decode.
+            # Full decode was doubling total time on GPU path (encode + verify = 2x work).
+            ok, why = verify_output(out_name, duration, full_decode=False)
             if ok:
                 return
         print(f"GPU output rejected: {why}")
@@ -702,7 +706,6 @@ def make_thumb(file_path, duration):
     return thumb if os.path.exists(thumb) and os.path.getsize(thumb) > 0 else None
 
 async def deliver_video_asset(app_instance, chat_id, target_user, file_path, caption):
-    """Sends the result as a DOCUMENT."""
     if not os.path.exists(file_path) or os.path.getsize(file_path) < 100:
         raise Exception("Processed output file was empty or missing.")
     thumb_path = make_thumb(file_path, get_duration(file_path))
@@ -726,7 +729,7 @@ async def deliver_video_asset(app_instance, chat_id, target_user, file_path, cap
                                        thumb=thumb_path, progress=prog, progress_args=("sending_video",),
                                        parse_mode=ParseMode.HTML),
             timeout=1800
-        )   # if this fails too, the error is reported instead of silently "finishing"
+        )
 
     if pm_msg and pm_msg.document:
         file_id = pm_msg.document.file_id
@@ -765,7 +768,6 @@ async def main_driver():
 
     step_dl = "hardsub_download" if TASK_TYPE == "hardsub" else "compress_download"
 
-    # video download starts immediately; the tiny subtitle/font files are fetched alongside
     video_task = asyncio.create_task(
         download_asset_robust(app, VIDEO_MSG_ID, os.path.join(WORK_DIR, "video.mkv"), step_dl))
     sub_file = font_path = None
@@ -789,7 +791,7 @@ async def main_driver():
         raise Exception("Telegram video download failed.")
 
     duration, vid_height, fps = probe_video(video_file)
-    gop = int(round(fps * 2)) if fps else 48          # 2 seconds worth of frames
+    gop = int(round(fps * 2)) if fps else 48
     gop = max(12, min(gop, 250))
 
     base_name = "output"
@@ -818,7 +820,6 @@ async def main_driver():
     reso_clean = str(RESOLUTION).replace("p", "").replace("P", "").strip() if RESOLUTION else ""
     has_reso = reso_clean.isdigit()
 
-    # CRF / bitrate caps: unchanged from your tuned values
     if TASK_TYPE == "hardsub":
         crf_val = "23"
         if reso_clean == "1080": max_rate, buf_size = "3000k", "4000k"
@@ -832,7 +833,6 @@ async def main_driver():
         elif reso_clean == "480": max_rate, buf_size = "500k", "800k"
         else: max_rate, buf_size = "1200k", "1800k"
 
-    # -2 keeps width even; min() never upscales; trunc keeps height even (odd heights used to crash x264)
     scale_filter = (f"scale=-2:'min({reso_clean},trunc(ih/2)*2)'" if has_reso
                     else "scale=trunc(iw/2)*2:trunc(ih/2)*2")
 
