@@ -5,7 +5,6 @@ def _ensure_user_site_path():
     user_site = site.getusersitepackages()
     if os.path.exists(user_site) and user_site not in sys.path:
         sys.path.insert(0, user_site)
-
 _ensure_user_site_path()
 
 WORK_DIR = "/kaggle/working" if os.path.exists("/kaggle") else "/tmp/kavvle_work"
@@ -79,7 +78,7 @@ def ensure_deps():
         cmd = [sys.executable, "-m", "pip", "install", "-q", "--user", "--no-cache-dir", *need]
         try:
             subprocess.run(cmd, check=True)
-        except Exception:
+        except:
             subprocess.run(cmd, check=False)
         _ensure_user_site_path()
         importlib.invalidate_caches()
@@ -99,9 +98,7 @@ ensure_fonts()
 import pyrogram.utils
 from pyrogram import Client
 from pyrogram.enums import ParseMode
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from fontTools.ttLib import TTFont
-
 pyrogram.utils.get_peer_type = lambda p: "channel" if str(p).startswith("-100") else "chat" if str(p).startswith("-") else "user"
 
 def reset_prog():
@@ -187,12 +184,13 @@ def get_font_name(font_path):
         pass
     return "Arial"
 
+# ===== FIXED DIALOGUE SIZE - 75 (pehle 90 tha) =====
 PLAY_W, PLAY_H = 1920, 1080
-DLG_FONT_SIZE = 90
-DLG_OUTLINE = 4
-DLG_SHADOW = 3
-DLG_MARGIN_V = 70
-DLG_MARGIN_LR = 75
+DLG_FONT_SIZE = 75
+DLG_OUTLINE = 3
+DLG_SHADOW = 2
+DLG_MARGIN_V = 60
+DLG_MARGIN_LR = 70
 
 def sec_to_ass_time(seconds):
     cs = int(round(max(0.0, float(seconds)) * 100))
@@ -356,7 +354,7 @@ def prepare_subtitle(sub_file, font_name, custom_font, out_path, font_path=None)
     ass = build_dialogue_ass(cues, font_name, bold=not custom_font, meter=meter)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(ass)
-    return False
+    return True
 
 async def kill_all_other_notebooks():
     username = os.environ.get("KAGGLE_USERNAME", "").strip()
@@ -388,7 +386,7 @@ async def download_message_asset(app_instance, msg_id_str, output_path, step_nam
         msg_id = int(msg_id_str)
         msg = await app_instance.get_messages(DESK_CHANNEL_ID, msg_id)
         if not msg:
-            raise Exception(f"Mirrored asset {msg_id} was removed")
+            raise Exception(f"Mirrored asset {msg_id} removed")
         media = msg.document or msg.video or msg.audio or msg.photo or msg.animation
         if not media:
             raise Exception("No valid stream")
@@ -467,7 +465,7 @@ def run_ffmpeg_sync(cmd, duration, process_title):
     proc.wait()
     return proc.returncode, log_tail
 
-# ================= FIXED - FULL SPEED + KEYFRAME FIX =================
+# ===== FINAL FIXED ENCODING - FULL SPEED + NO FATNA + KEYFRAME + WATERMARK =====
 def build_ffmpeg_cmds(video_file, out_name, crf, max_rate, buf_size, gop, vf=None, complex_f=None, wm_file=None):
     KEY_SEC = 2
     if gop < 12:
@@ -481,7 +479,9 @@ def build_ffmpeg_cmds(video_file, out_name, crf, max_rate, buf_size, gop, vf=Non
     head += ["-map", "0:a?", "-sn", "-dn"]
     tail_audio = ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-max_muxing_queue_size", "1024", "-movflags", "+faststart", out_name]
     key_args = ["-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0", "-force_key_frames", str(KEY_SEC)]
+    # CPU - ultrafast but with better quality params
     cpu = head + ["-c:v", "libx264", "-preset", "ultrafast", "-crf", crf, "-maxrate", max_rate, "-bufsize", buf_size, "-threads", "0", "-x264-params", f"keyint={gop}:min-keyint={gop}:scenecut=0:open-gop=0"] + key_args + tail_audio
+    # GPU - p1 fastest, full speed
     gpu = head + ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-cq", crf, "-b:v", "0", "-maxrate", max_rate, "-bufsize", buf_size, "-spatial-aq", "1", "-bf", "0", "-rc-lookahead", "0", "-profile:v", "high"] + key_args + tail_audio
     return gpu, cpu
 
@@ -630,45 +630,63 @@ async def main_driver():
     wm_file = None
     extracted_subs = []
     if TASK_TYPE == "hardsub":
-        has_watermark = prepare_subtitle(sub_file, font_name, custom_font, os.path.join(WORK_DIR, "ready_sub.ass"), font_path=font_path)
-        if WM_MSG_ID and WM_MSG_ID != "none" and not has_watermark:
+        # subtitle prepare - font fix absolute path
+        fonts_dir_abs = os.path.join(WORK_DIR, "fonts")
+        prepare_subtitle(sub_file, font_name, custom_font, os.path.join(WORK_DIR, "ready_sub.ass"), font_path=font_path)
+        if WM_MSG_ID and WM_MSG_ID != "none":
             wm_file = await download_asset_robust(app, WM_MSG_ID, os.path.join(WORK_DIR, "watermark.png"), "wm", show_progress=False)
+            print(f"Watermark file: {wm_file} exists={os.path.exists(wm_file) if wm_file else False}")
     await app.stop()
     process_title = "Compressing" if TASK_TYPE == "compress" else "Encoding Hardsub"
     reso_clean = str(RESOLUTION).replace("p", "").replace("P", "").strip() if RESOLUTION else ""
     has_reso = reso_clean.isdigit()
+
+    # ===== FIXED BITRATE - 1080 & 720 DONO KE LIYE NO FATNA =====
     if TASK_TYPE == "hardsub":
-        crf_val = "23"
-        if reso_clean == "1080": max_rate, buf_size = "3000k", "4000k"
-        elif reso_clean == "720": max_rate, buf_size = "1500k", "2000k"
-        elif reso_clean == "480": max_rate, buf_size = "800k", "1200k"
-        else: max_rate, buf_size = "2500k", "3500k"
+        crf_val = "22"
+        if reso_clean == "1080": max_rate, buf_size = "4000k", "6000k"
+        elif reso_clean == "720": max_rate, buf_size = "2500k", "3500k"
+        elif reso_clean == "480": max_rate, buf_size = "1200k", "1800k"
+        else: max_rate, buf_size = "3500k", "5000k"
     else:
-        crf_val = "28"
-        if reso_clean == "1080": max_rate, buf_size = "1400k", "2000k"
-        elif reso_clean == "720": max_rate, buf_size = "850k", "1300k"
-        elif reso_clean == "480": max_rate, buf_size = "500k", "800k"
-        else: max_rate, buf_size = "1200k", "1800k"
-    scale_filter = (f"scale=-2:'min({reso_clean},trunc(ih/2)*2)'" if has_reso else "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+        crf_val = "26"
+        if reso_clean == "1080": max_rate, buf_size = "3000k", "4500k"
+        elif reso_clean == "720": max_rate, buf_size = "2000k", "3000k"
+        elif reso_clean == "480": max_rate, buf_size = "1000k", "1500k"
+        else: max_rate, buf_size = "2500k", "3500k"
+
+    # scale with lanczos for sharp resize
+    if has_reso:
+        scale_filter = f"scale=-2:'min({reso_clean},trunc(ih/2)*2)':flags=lanczos"
+    else:
+        scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos"
+
     if TASK_TYPE == "compress":
         fire_and_forget_http(f"⚙️ <b>{process_title}</b>\n{get_process_bar(0)} [0.0%]")
         cmd_gpu, cmd_cpu = build_ffmpeg_cmds(video_file, out_name, crf_val, max_rate, buf_size, gop, vf=scale_filter)
         extract_task = asyncio.create_task(asyncio.to_thread(extract_embedded_subs_sync, video_file, base_name))
         await asyncio.to_thread(encode_with_fallback, cmd_gpu, cmd_cpu, duration, process_title, out_name)
         extracted_subs = await extract_task
+
     elif TASK_TYPE == "hardsub":
-        vf_filter = "subtitles='ready_sub.ass':charenc=UTF-8"
+        # FIXED subtitle filter - absolute fontsdir
+        fonts_dir_abs = os.path.join(WORK_DIR, "fonts")
+        vf_filter = f"subtitles='{os.path.join(WORK_DIR, 'ready_sub.ass')}':charenc=UTF-8"
         if custom_font:
-            vf_filter += ":fontsdir=fonts"
+            vf_filter += f":fontsdir={fonts_dir_abs}"
         v_filter = f"{scale_filter},{vf_filter}"
-        overlay_coord = "W-w-15:15" if WM_POS == "right" else "15:15"
+        overlay_coord = "W-w-20:20" if WM_POS == "right" else "20:20"
         fire_and_forget_http(f"⚙️ <b>{process_title}</b>\n{get_process_bar(0)} [0.0%]")
+
         if wm_file and os.path.exists(wm_file):
-            complex_f = f"[0:v]{v_filter}[vsub];[1:v]scale=-1:min(ih*0.08\\,80)[wm];[vsub][wm]overlay={overlay_coord},format=yuv420p[vout]"
+            # FIXED WATERMARK - bigger, visible, lanczos, alpha support
+            complex_f = f"[0:v]{v_filter}[vsub];[1:v]scale=-1:min(ih*0.15\\,140):flags=lanczos[wm];[vsub][wm]overlay={overlay_coord}:format=auto:alpha=1,format=yuv420p[vout]"
             cmd_gpu, cmd_cpu = build_ffmpeg_cmds(video_file, out_name, crf_val, max_rate, buf_size, gop, complex_f=complex_f, wm_file=wm_file)
         else:
             cmd_gpu, cmd_cpu = build_ffmpeg_cmds(video_file, out_name, crf_val, max_rate, buf_size, gop, vf=v_filter)
+
         await asyncio.to_thread(encode_with_fallback, cmd_gpu, cmd_cpu, duration, process_title, out_name)
+
     if SESSION_STRING:
         app = Client("worker_up", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
     else:
