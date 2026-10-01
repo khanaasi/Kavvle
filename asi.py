@@ -14,6 +14,10 @@ os.chdir(WORK_DIR)
 if shutil.which("ffmpeg") is None:
     subprocess.run("apt-get update && apt-get install -y ffmpeg", shell=True)
 
+# ===== SETTINGS (yahin se badlo) =====
+PROGRESS_INTERVAL = 10      # progress bar kitne second me ek baar update ho
+WM_HEIGHT_RATIO = 0.12      # watermark ki height = video height ka 12%
+
 last_time = 0
 start_time = 0
 status_msg_id = None
@@ -41,6 +45,42 @@ def report_critical_failure(error_msg):
     except:
         pass
 
+# ----------------------------- CONFIG HELPERS (alias support) -----------------------------
+def _is_empty(v):
+    return v is None or v is False or str(v).strip().lower() in ("", "none", "null", "false")
+
+def _looks_like_asset(v):
+    s = str(v).strip()
+    return s.isdigit() or len(s) >= 20
+
+_WM_ID_NAMES = ("wm_msg_id", "watermark_msg_id", "wm_id", "wm_file_id", "watermark_file_id",
+                "watermark_id", "watermark", "wm", "wm_file", "watermark_file", "wm_message_id",
+                "watermark_message_id", "logo_msg_id", "logo_id", "logo")
+_WM_POS_NAMES = ("wm_pos", "watermark_pos", "wm_position", "watermark_position",
+                 "wm_side", "watermark_side", "wm_align", "position", "pos")
+_WM_SKIP_PARTS = ("pos", "side", "align", "size", "scale", "opacity", "enable", "mode")
+
+def pick_watermark_id(cfg):
+    low = {str(k).lower(): v for k, v in cfg.items()}
+    for n in _WM_ID_NAMES:
+        v = low.get(n)
+        if not _is_empty(v) and _looks_like_asset(v):
+            return str(v).strip()
+    for k, v in low.items():  # fuzzy fallback: koi bhi key jisme wm / water / logo ho
+        if any(p in k for p in ("wm", "water", "logo")) and not any(p in k for p in _WM_SKIP_PARTS):
+            if not _is_empty(v) and _looks_like_asset(v):
+                return str(v).strip()
+    return "none"
+
+def pick_watermark_pos(cfg):
+    low = {str(k).lower(): v for k, v in cfg.items()}
+    raw = "right"
+    for n in _WM_POS_NAMES:
+        if not _is_empty(low.get(n)):
+            raw = str(low[n]).strip().lower()
+            break
+    return "left" if ("left" in raw or raw in ("l", "tl")) else "right"
+
 try:
     def load_config():
         if not CONFIG_B64:
@@ -54,16 +94,18 @@ try:
     CHAT_ID = int(CFG["chat_id"])
     USER_ID = int(CFG.get("user_id") or CFG["chat_id"])
     RESOLUTION = CFG.get("resolution", "none")
-    WM_POS = CFG.get("wm_pos", "right")
     RENAME = CFG.get("rename", "none")
     TRIGGER_MSG_ID = CFG.get("trigger_msg_id")
     VIDEO_MSG_ID = CFG.get("video_msg_id", "none")
     SUB_MSG_ID = CFG.get("sub_msg_id", "none")
-    WM_MSG_ID = CFG.get("wm_msg_id", "none")
     FONT_MSG_ID = CFG.get("font_msg_id", "none")
+    WM_MSG_ID = pick_watermark_id(CFG)
+    WM_POS = pick_watermark_pos(CFG)
     DESK_CHANNEL_ID = -1003700822969
     HW_MODE = CFG.get("hardware_mode", "cpu")
     SESSION_STRING = CFG.get("session_string", None)
+    print(f"[cfg] keys received: {sorted(str(k) for k in CFG.keys())}")
+    print(f"[wm] id found: {WM_MSG_ID != 'none'} | pos: {WM_POS}")
 except Exception:
     tb = traceback.format_exc()
     report_critical_failure(tb)
@@ -120,6 +162,10 @@ def get_send_bar(percent):
     filled = int(percent / 100 * 20)
     return f"[{'▓' * filled}{'▒' * (20 - filled)}]"
 
+# ----------------------------- THROTTLED STATUS EDIT -----------------------------
+_last_http_edit = 0.0
+_edit_lock = threading.Lock()
+
 def _sync_http_edit(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     payload = {"chat_id": CHAT_ID, "message_id": status_msg_id, "text": text, "parse_mode": "HTML", "reply_markup": {"inline_keyboard": [[{"text": "🛑 Cancel Task", "callback_data": "cancel_active_run"}]]}}
@@ -128,7 +174,14 @@ def _sync_http_edit(text):
     except:
         pass
 
-def fire_and_forget_http(text):
+def fire_and_forget_http(text, force=False):
+    """Har PROGRESS_INTERVAL second me max 1 edit. force=True sirf start/end ke messages ke liye."""
+    global _last_http_edit
+    now = time.time()
+    with _edit_lock:
+        if not force and now - _last_http_edit < PROGRESS_INTERVAL:
+            return
+        _last_http_edit = now
     threading.Thread(target=_sync_http_edit, args=(text,), daemon=True).start()
 
 def prog(current, total, step_name):
@@ -138,7 +191,8 @@ def prog(current, total, step_name):
         start_time = now
         last_time = now
         return
-    if now - last_time >= 12 or current >= total:
+    done = total > 0 and current >= total
+    if now - last_time >= PROGRESS_INTERVAL or done:
         elapsed = now - start_time
         speed = current / elapsed if elapsed > 0 else 0
         speed_mb = (speed / 1024) / 1024
@@ -147,7 +201,7 @@ def prog(current, total, step_name):
             text = f"📥 <b>Downloading Video</b>\n{get_download_bar(percent)} [{percent:.1f}%]\n🚀 Speed: <b>{speed_mb:.2f} MB/s</b>\n📦 {current/1048576:.1f}MB / {total/1048576:.1f}MB"
         else:
             text = f"📤 <b>Sending Video</b>\n{get_send_bar(percent)} [{percent:.1f}%]\n🚀 Speed: <b>{speed_mb:.2f} MB/s</b>\n📦 {current/1048576:.1f}MB / {total/1048576:.1f}MB"
-        fire_and_forget_http(text)
+        fire_and_forget_http(text, force=done)
         last_time = now
 
 def probe_video(video_path):
@@ -184,7 +238,6 @@ def get_font_name(font_path):
         pass
     return "Arial"
 
-# ===== FIXED DIALOGUE SIZE - 75 (pehle 90 tha) =====
 PLAY_W, PLAY_H = 1920, 1080
 DLG_FONT_SIZE = 75
 DLG_OUTLINE = 3
@@ -360,6 +413,7 @@ async def kill_all_other_notebooks():
     username = os.environ.get("KAGGLE_USERNAME", "").strip()
     api_key = os.environ.get("KAGGLE_KEY", "").strip()
     current_kernel = os.environ.get("KAGGLE_KERNEL_NAME", "").strip()
+    cur_slug = current_kernel.split("/")[-1].lower()
     if not username or not api_key:
         return
     os.environ["KAGGLE_USERNAME"] = username
@@ -374,7 +428,10 @@ async def kill_all_other_notebooks():
         if not parts:
             continue
         ref = parts[0].strip()
-        if current_kernel and ref == current_kernel:
+        if not ref:
+            continue
+        # apne aap ko kabhi delete nahi karna (slug se compare, "user/slug" ya sirf "slug" dono chalega)
+        if cur_slug and ref.split("/")[-1].lower() == cur_slug:
             continue
         del_proc = await asyncio.create_subprocess_exec("kaggle", "kernels", "delete", "-k", ref, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await del_proc.communicate()
@@ -453,7 +510,7 @@ def run_ffmpeg_sync(cmd, duration, process_title):
                 log_tail.pop(0)
         if line.startswith("out_time_us=") and duration > 0:
             now = time.time()
-            if now - last_edit >= 12:
+            if now - last_edit >= PROGRESS_INTERVAL:
                 try:
                     us = int(line.split("=")[1])
                     percent = min((us / 1_000_000.0 / duration) * 100, 100.0)
@@ -465,9 +522,7 @@ def run_ffmpeg_sync(cmd, duration, process_title):
     proc.wait()
     return proc.returncode, log_tail
 
-# ===== FINAL FIXED ENCODING - FULL SPEED + NO FATNA + KEYFRAME + WATERMARK =====
 def build_ffmpeg_cmds(video_file, out_name, crf, max_rate, buf_size, gop, vf=None, complex_f=None, wm_file=None):
-    KEY_SEC = 2
     if gop < 12:
         gop = 60
     gop = max(24, min(gop, 250))
@@ -477,12 +532,11 @@ def build_ffmpeg_cmds(video_file, out_name, crf, max_rate, buf_size, gop, vf=Non
     else:
         head += ["-vf", vf, "-map", "0:v:0"]
     head += ["-map", "0:a?", "-sn", "-dn"]
-    tail_audio = ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-max_muxing_queue_size", "1024", "-movflags", "+faststart", out_name]
-    key_args = ["-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0", "-force_key_frames", str(KEY_SEC)]
-    # CPU - ultrafast but with better quality params
-    cpu = head + ["-c:v", "libx264", "-preset", "ultrafast", "-crf", crf, "-maxrate", max_rate, "-bufsize", buf_size, "-threads", "0", "-x264-params", f"keyint={gop}:min-keyint={gop}:scenecut=0:open-gop=0"] + key_args + tail_audio
-    # GPU - p1 fastest, full speed
-    gpu = head + ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-cq", crf, "-b:v", "0", "-maxrate", max_rate, "-bufsize", buf_size, "-spatial-aq", "1", "-bf", "0", "-rc-lookahead", "0", "-profile:v", "high"] + key_args + tail_audio
+    tail = ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-max_muxing_queue_size", "1024", "-movflags", "+faststart", out_name]
+    # har 2 second me keyframe (seeking fast) - pehle yahan "-force_key_frames 2" tha jo sirf 1 keyframe force karta tha
+    key_args = ["-g", str(gop), "-force_key_frames", "expr:gte(t,n_forced*2)", "-forced-idr", "1"]
+    cpu = head + ["-c:v", "libx264", "-preset", "ultrafast", "-crf", crf, "-maxrate", max_rate, "-bufsize", buf_size, "-threads", "0", "-sc_threshold", "0", "-x264-params", "open-gop=0"] + key_args + tail
+    gpu = head + ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-cq", crf, "-b:v", "0", "-maxrate", max_rate, "-bufsize", buf_size, "-spatial-aq", "1", "-bf", "0", "-rc-lookahead", "0", "-profile:v", "high"] + key_args + tail
     return gpu, cpu
 
 def _faststart_ok(path):
@@ -552,7 +606,7 @@ def encode_with_fallback(base_cmd_gpu, base_cmd_cpu, duration, title, out_name):
             if ok:
                 return
         print(f"GPU output rejected: {why}")
-        fire_and_forget_http("⚠️ GPU fallback -> CPU...")
+        fire_and_forget_http("⚠️ GPU fallback -> CPU...", force=True)
     rc, log = run_ffmpeg_sync(base_cmd_cpu, duration, title + " (CPU)")
     if rc != 0:
         raise Exception("FFmpeg crashed\n" + "\n".join(log[-8:]))
@@ -630,18 +684,19 @@ async def main_driver():
     wm_file = None
     extracted_subs = []
     if TASK_TYPE == "hardsub":
-        # subtitle prepare - font fix absolute path
-        fonts_dir_abs = os.path.join(WORK_DIR, "fonts")
         prepare_subtitle(sub_file, font_name, custom_font, os.path.join(WORK_DIR, "ready_sub.ass"), font_path=font_path)
-        if WM_MSG_ID and WM_MSG_ID != "none":
+        if WM_MSG_ID != "none":
             wm_file = await download_asset_robust(app, WM_MSG_ID, os.path.join(WORK_DIR, "watermark.png"), "wm", show_progress=False)
-            print(f"Watermark file: {wm_file} exists={os.path.exists(wm_file) if wm_file else False}")
+            if not wm_file or not os.path.exists(wm_file) or os.path.getsize(wm_file) < 50:
+                raise Exception("Watermark maanga gaya tha par download nahi hua. Watermark dobara bhejo.")
+            print(f"[wm] file ready: {wm_file} ({os.path.getsize(wm_file)} bytes)")
+        else:
+            print("[wm] koi watermark config me nahi mila, bina watermark ke encode hoga")
     await app.stop()
     process_title = "Compressing" if TASK_TYPE == "compress" else "Encoding Hardsub"
     reso_clean = str(RESOLUTION).replace("p", "").replace("P", "").strip() if RESOLUTION else ""
     has_reso = reso_clean.isdigit()
 
-    # ===== FIXED BITRATE - 1080 & 720 DONO KE LIYE NO FATNA =====
     if TASK_TYPE == "hardsub":
         crf_val = "22"
         if reso_clean == "1080": max_rate, buf_size = "4000k", "6000k"
@@ -655,32 +710,39 @@ async def main_driver():
         elif reso_clean == "480": max_rate, buf_size = "1000k", "1500k"
         else: max_rate, buf_size = "2500k", "3500k"
 
-    # scale with lanczos for sharp resize
+    # lanczos hata diya (slow tha), default bicubic fast + achha hai
     if has_reso:
-        scale_filter = f"scale=-2:'min({reso_clean},trunc(ih/2)*2)':flags=lanczos"
+        scale_filter = f"scale=-2:'min({reso_clean},trunc(ih/2)*2)'"
     else:
-        scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos"
+        scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
 
     if TASK_TYPE == "compress":
-        fire_and_forget_http(f"⚙️ <b>{process_title}</b>\n{get_process_bar(0)} [0.0%]")
+        fire_and_forget_http(f"⚙️ <b>{process_title}</b>\n{get_process_bar(0)} [0.0%]", force=True)
         cmd_gpu, cmd_cpu = build_ffmpeg_cmds(video_file, out_name, crf_val, max_rate, buf_size, gop, vf=scale_filter)
         extract_task = asyncio.create_task(asyncio.to_thread(extract_embedded_subs_sync, video_file, base_name))
         await asyncio.to_thread(encode_with_fallback, cmd_gpu, cmd_cpu, duration, process_title, out_name)
         extracted_subs = await extract_task
 
     elif TASK_TYPE == "hardsub":
-        # FIXED subtitle filter - absolute fontsdir
         fonts_dir_abs = os.path.join(WORK_DIR, "fonts")
         vf_filter = f"subtitles='{os.path.join(WORK_DIR, 'ready_sub.ass')}':charenc=UTF-8"
         if custom_font:
             vf_filter += f":fontsdir={fonts_dir_abs}"
         v_filter = f"{scale_filter},{vf_filter}"
-        overlay_coord = "W-w-20:20" if WM_POS == "right" else "20:20"
-        fire_and_forget_http(f"⚙️ <b>{process_title}</b>\n{get_process_bar(0)} [0.0%]")
+        fire_and_forget_http(f"⚙️ <b>{process_title}</b>\n{get_process_bar(0)} [0.0%]", force=True)
 
         if wm_file and os.path.exists(wm_file):
-            # FIXED WATERMARK - bigger, visible, lanczos, alpha support
-            complex_f = f"[0:v]{v_filter}[vsub];[1:v]scale=-1:min(ih*0.15\\,140):flags=lanczos[wm];[vsub][wm]overlay={overlay_coord}:format=auto:alpha=1,format=yuv420p[vout]"
+            # watermark ki size output video ki height ke hisaab se (python me nikali, filter me guess nahi)
+            src_h = vid_height if vid_height > 0 else 720
+            out_h = min(int(reso_clean), src_h) if has_reso else src_h
+            wm_h = max(24, int(out_h * WM_HEIGHT_RATIO))
+            wm_h -= wm_h % 2
+            margin = max(10, int(out_h * 0.02))
+            overlay_coord = f"W-w-{margin}:{margin}" if WM_POS == "right" else f"{margin}:{margin}"
+            complex_f = (f"[0:v]{v_filter}[vsub];"
+                         f"[1:v]format=rgba,scale=-2:{wm_h}[wm];"
+                         f"[vsub][wm]overlay={overlay_coord},format=yuv420p[vout]")
+            print(f"[wm] out_h={out_h} wm_h={wm_h} pos={WM_POS} coord={overlay_coord}")
             cmd_gpu, cmd_cpu = build_ffmpeg_cmds(video_file, out_name, crf_val, max_rate, buf_size, gop, complex_f=complex_f, wm_file=wm_file)
         else:
             cmd_gpu, cmd_cpu = build_ffmpeg_cmds(video_file, out_name, crf_val, max_rate, buf_size, gop, vf=v_filter)
@@ -692,7 +754,7 @@ async def main_driver():
     else:
         app = Client("worker_up", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=32, max_concurrent_transmissions=16, no_updates=True, in_memory=True)
     await app.start()
-    fire_and_forget_http(f"📤 <b>Sending Video</b>\n{get_send_bar(0)} [0.0%]")
+    fire_and_forget_http(f"📤 <b>Sending Video</b>\n{get_send_bar(0)} [0.0%]", force=True)
     caption = os.path.basename(out_name)
     await deliver_video_asset(app, CHAT_ID, USER_ID, out_name, caption)
     if TASK_TYPE == "compress" and extracted_subs:
